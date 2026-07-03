@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# 数据集与实验产物（任意层级）
+**/datasets/
+**/data/
+**/outputs/
+**/models/
+
+# 以 outputs / models 为前缀的目录（任意层级，含 outputs、outputs_xxx 等）
+**/outputs*/
+**/models*/
