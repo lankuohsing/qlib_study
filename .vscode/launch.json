@@ -7,7 +7,7 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
-            "cwd": "${workspaceFolder}",
+            "cwd": "${fileDirname}",
             "justMyCode": true
         }
     ]
