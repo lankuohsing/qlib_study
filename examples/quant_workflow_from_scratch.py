@@ -86,13 +86,13 @@ def score_lr(df, factors, model):
 
 
 def calc_performance(series):
-    cum     = (1 + series).cumprod()
-    n       = len(series)
-    ann_ret = cum.iloc[-1] ** (252 / n) - 1
-    ann_vol = series.std() * np.sqrt(252)
-    sharpe  = ann_ret / (ann_vol + 1e-9)
-    max_dd  = ((cum - cum.cummax()) / cum.cummax()).min()
-    cum_ret = cum.iloc[-1] - 1
+    cum     = (1 + series).cumprod()# 把日收益率转成净值曲线。
+    n       = len(series)# 总交易日数，用于年化换算。
+    ann_ret = cum.iloc[-1] ** (252 / n) - 1# 年化收益率。
+    ann_vol = series.std() * np.sqrt(252)# 年化波动率。
+    sharpe  = ann_ret / (ann_vol + 1e-9)# 夏普比率 = 年化收益 ÷ 年化波动。
+    max_dd  = ((cum - cum.cummax()) / cum.cummax()).min()# 最大回撤
+    cum_ret = cum.iloc[-1] - 1# 累计收益率，即整个测试期的总涨跌幅。
     return {
         "年化收益": f"{ann_ret:.2%}",
         "年化波动": f"{ann_vol:.2%}",
@@ -349,6 +349,10 @@ if __name__ == "__main__":
     print("── 方式 A：对有效因子等权平均 ──")
     print(f"  参与合成的因子: {valid_factors}")
 
+    # 注意：这里没有按训练集 IC 符号对因子方向做校正。
+    # 原因：IC 符号在不同市场 regime 下可能翻转（如训练期均值回归、测试期趋势延续），
+    # 用训练集 IC 符号固定校正测试期会引入隐性的 regime 假设，反而使结果更差。
+    # 更稳健的做法是滚动估计 IC 符号，但会增加复杂度，超出本脚本范围。
     train_score_ew = score_equal_weight(train_df, valid_factors)
     valid_score_ew = score_equal_weight(valid_df, valid_factors)
     test_score_ew  = score_equal_weight(test_df,  valid_factors)
@@ -414,7 +418,7 @@ if __name__ == "__main__":
     # ─────────────────────────────────────────────────────
     # Step 6+7  组合构建 + 回测（EW 和 LR 各走一遍）
     # ─────────────────────────────────────────────────────
-    test_ret_wide = close.loc[TEST_START:TEST_END].pct_change()
+    test_ret_wide = close.loc[TEST_START:TEST_END].pct_change()# 每只股票每天相对前一日收盘价的涨跌幅
     print(f"\n日收益率宽表  shape = {test_ret_wide.shape}  ({test_ret_wide.shape[0]} 交易日 × {test_ret_wide.shape[1]} 股票)")
     print("回测逻辑：T 日因子 → 选出 Top-K 持仓 → T+1 日等权持有 → 扣手续费")
 

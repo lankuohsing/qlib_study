@@ -14,8 +14,8 @@
 5. [Step 3 因子预处理](#5-step-3-因子预处理)
 6. [Step 4 因子有效性分析（IC / ICIR）](#6-step-4-因子有效性分析ic--icir)
 7. [Step 5 因子合成](#7-step-5-因子合成)
-8. [Step 6 组合构建](#8-step-6-组合构建)
-9. [Step 7 回测](#9-step-7-回测)
+8. [Step 6+7 组合构建与回测](#8-step-67-组合构建与回测)
+9. [绩效汇总对比](#9-绩效汇总对比)
 10. [结果解读与常见问题](#10-结果解读与常见问题)
 
 ---
@@ -56,14 +56,14 @@ DATA_START(2014-06) ──→ TRAIN(2015~2017) ──→ VALID(2018) ──→ T
   factor_df (7 个因子 + 1 个 label)
      ↓ Step 3  截面标准化 + 过滤
   clean_df → train / valid / test 三段
-     ↓ Step 4  IC / ICIR 分析
+     ↓ Step 4  IC / ICIR 分析（用 train_df）
   筛选有效因子列表
-     ↓ Step 5  因子合成
-  test_score（每只股票每天一个综合得分）
-     ↓ Step 6  Top-K 选股
-  holdings（每天持哪些股票）
-     ↓ Step 7  逐日模拟
-  净值曲线 + 绩效指标
+     ↓ Step 5  因子合成（EW 和 LR 两种，均在 test_df 上生成得分）
+  test_score_ew  /  test_score_lr
+     ↓ Step 6+7  run_backtest()（对 EW 和 LR 各调用一次）
+  ret_results["等权EW"]  /  ret_results["LR"]
+     ↓ 绩效汇总
+  并排对比 EW / LR / 基准
 ```
 
 ---
@@ -225,7 +225,7 @@ Step 1 加载了完整历史（为了预热 rolling 窗口），这里把"某天
 
 ### 5.5 三段切分
 
-预处理完成后，按时间将数据分为训练集（用于训练模型、计算 IC）、验证集（选择合成方式）、测试集（最终回测），严格避免**前视偏差（look-ahead bias）**——即用未来数据辅助当前决策。
+预处理完成后，按时间将数据分为训练集（用于训练模型、计算 IC）、验证集（对比合成方式的 IC）、测试集（最终回测），严格避免**前视偏差（look-ahead bias）**——即用未来数据辅助当前决策。
 
 ---
 
@@ -305,19 +305,36 @@ lr = LinearRegression().fit(X_tr, y_tr)
 **为什么 R² 这么低（< 0.01）？**  
 这是量化领域的正常现象。市场是半有效的，单个线性模型能解释的收益方差极少。R² 低不代表模型没用——哪怕 IC 只有 0.03，在数百只股票上持续应用也能产生显著的累积超额收益。
 
-### 7.3 在验证集上对比
+### 7.3 在验证集上对比两种合成方式的 IC
 
-脚本在验证集上对比两种合成方式的 IC，并选择**等权合成**进入回测：
+```python
+for method_name, get_score in [
+    ("等权EW", lambda: valid_score_ew),
+    ("LR",     lambda: score_lr(valid_df, valid_factors, lr)),
+]:
+    # ... 计算该方法在 valid 段的 IC 均值和 ICIR
+```
 
-> **等权合成更鲁棒，不过拟合训练集。**
+脚本在验证集上对比两种合成方式的 IC，用于参考哪种方式更稳定。但**不做硬性选择**——两种方式都会进入 Step 6+7 的回测，并在最终绩效表中并排对比，由数据说话。
 
-这是量化领域的一个重要经验：简单方法往往胜过复杂模型，因为金融数据的信噪比极低，复杂模型很容易过拟合历史规律而在未来失效。
-
-这与 ML 的模型选择逻辑完全一致：在 valid 集上选方法，在 test 集上做最终评估。
+这与 ML 模型选择的逻辑一致：在 valid 集上评估候选模型，在 test 集上做最终评估，中间不做"手动挑赢家"。
 
 ---
 
-## 8 Step 6 组合构建
+## 8 Step 6+7 组合构建与回测
+
+### 8.1 两种合成方式各走一遍
+
+脚本将 Step 6（组合构建）和 Step 7（回测）合并到 `run_backtest()` 函数中，对等权（EW）和线性回归（LR）各调用一次：
+
+```python
+ret_results = {}
+for method_name, test_score in [("等权EW", test_score_ew), ("LR", test_score_lr)]:
+    ret_df = run_backtest(test_score, test_ret_wide)
+    ret_results[method_name] = ret_df
+```
+
+### 8.2 Step 6：每日 Top-K 选股
 
 ```python
 holdings = {}
@@ -332,11 +349,7 @@ for date, grp in test_score.groupby(level="datetime"):
 
 这是一个**纯多头、等权重**的策略。真实量化策略还可以做多空（做空得分低的股票）、根据预测置信度调整权重、加入风险约束等，但本脚本以学习为目的，保持简单。
 
----
-
-## 9 Step 7 回测
-
-### 9.1 回测时序逻辑（避免前视偏差）
+### 8.3 Step 7：逐日模拟（回测时序逻辑）
 
 ```
 T 日收盘 → 用 T 日因子计算得分 → 选出 Top-K 持仓（holdings[T]）
@@ -348,10 +361,13 @@ T+1 日收盘：持有 holdings[T]，实现 T+1 日的涨跌幅
 代码实现的核心逻辑：
 
 ```python
-for i, date_T in enumerate(dates):
+prev_set = set()  # 初始无持仓
+
+for date_T in sorted(holdings.keys()):
     curr_set   = set(holdings[date_T])        # T 日选出的新持仓
-    ret_stocks = list(prev_set) if prev_set else list(curr_set)
-    # ret_stocks = T-1 日持仓，今天（T日）实现其收益
+    ret_stocks = list(prev_set) if prev_set else []
+    # 第一天 prev_set 为空 → ret_stocks = []，无持仓无收益
+    # 后续每天：持有昨天选出的股票（prev_set），实现今天的涨跌幅
 
     port_ret = test_ret_wide.loc[date_T, valid_stocks].mean()
     # test_ret_wide.loc[date_T] = T-1日收盘到T日收盘的涨跌幅
@@ -359,9 +375,9 @@ for i, date_T in enumerate(dates):
     prev_set = curr_set  # 本轮持仓留作下一轮的 prev_set
 ```
 
-`test_ret_wide.loc[date_T]` 是"T-1 日收盘到 T 日收盘"的涨跌幅，而 `ret_stocks` 是 T-1 日选出的持仓——因此是用 **T-1 日的信号**去实现 **T 日的收益**，没有用到未来信息。
+关键点：`ret_stocks`（今天持有）= `prev_set`（昨天选出），因此是用 **T-1 日的信号**去实现 **T 日的收益**，没有用到未来信息。第一天建仓时无持仓，收益为 0，换手率按全仓建仓计为 1.0。
 
-### 9.2 换手率与手续费
+### 8.4 换手率与手续费
 
 ```python
 turnover = len(curr_set.symmetric_difference(prev_set)) / (2 * TOPK)
@@ -379,15 +395,20 @@ net_ret  = port_ret - turnover * TRANSACTION_COST
 
 高换手率会显著侵蚀收益，这是量化策略中需要特别关注的成本来源。
 
-### 9.3 基准对比
+---
+
+## 9 绩效汇总对比
+
+### 9.1 基准的定义
 
 ```python
-benchmark_ret = test_ret_wide.mean(axis=1).reindex(ret_df.index).fillna(0)
+benchmark_ret = test_ret_wide.mean(axis=1).reindex(
+    ret_results["等权EW"].index).fillna(0)
 ```
 
 基准为**等权指数**：每天对所有 CSI 300 成分股的涨跌幅取均值，近似于等权配置所有成分股。这与市值加权的"沪深 300 指数"不同，但足以衡量策略是否有超额收益。
 
-### 9.4 绩效指标
+### 9.2 绩效指标
 
 | 指标 | 公式 | 含义 | 参考水平 |
 |------|------|------|---------|
@@ -396,6 +417,15 @@ benchmark_ret = test_ret_wide.mean(axis=1).reindex(ret_df.index).fillna(0)
 | 夏普比率 | `年化收益 / 年化波动` | 单位风险的超额收益 | > 1 较好 |
 | 最大回撤 | `min((净值 - 历史最高) / 历史最高)` | 最大亏损幅度（负数）| 越小越好 |
 | 累计收益 | `最终净值 - 1` | 整个测试期的总收益 | > 0 |
+
+### 9.3 输出文件
+
+```
+outputs/nav_curve.csv   — 每日净值曲线（ew_nav, lr_nav, benchmark_nav, ew_excess, lr_excess）
+outputs/ic_analysis.csv — 各因子 IC 统计表
+```
+
+`ew_excess` = EW 策略净值 / 基准净值，表示超额收益累计倍数，> 1 说明跑赢基准。
 
 ---
 
@@ -420,13 +450,40 @@ benchmark_ret = test_ret_wide.mean(axis=1).reindex(ret_df.index).fillna(0)
 
 ### 10.3 过拟合风险
 
-本脚本用 valid 集选择了合成方式，用 train 集训练了线性回归权重。尽管如此，仍需警惕：
+本脚本用 train 集训练了线性回归权重，用 valid 集对比了两种合成方式的 IC，最终在 test 集上评估两者。尽管如此，仍需警惕：
 
 - 7 个因子的选择本身是基于对 A 股市场的先验知识，存在**研究者过拟合（researcher bias）**
 - IC 阈值（0.02）是在 train 集上确定的
 - test 集仅约 1.5 年，统计置信度有限
 
 真实的量化研究需要更严格的样本外测试（out-of-sample）和 walk-forward 验证（滚动扩窗或滑窗回测）。
+
+### 10.4 时间窗口切分的经验
+
+时间窗口的切分不只是"留出未来数据"，还需要关注**各段覆盖的市场 regime 是否合理**。本脚本的切分暴露了一个典型问题：
+
+```
+2015-2017  训练集：股灾 + 震荡（均值回归强，IC 全为负）
+2018       验证集：熊市
+2019-2020  测试集：牛市（趋势延续，IC 方向与训练期相反）
+```
+
+三段 regime 各不相同，训练集学到的 IC 符号、因子权重在测试集上失效。具体表现为：若按训练集 IC 符号对 EW 因子做方向校正，反而会在测试集选出预期下跌的股票，结果更差。
+
+**切分时的几个原则：**
+
+1. **切分前先做 regime 诊断**：画出全周期指数走势，标注牛/熊/震荡区间，检查三段是否各自覆盖了单一 regime
+2. **理想情况：每段都覆盖多种 regime**：训练集和测试集各自包含至少一段牛市和一段熊市，统计结论更稳健
+3. **测试集至少 3 年以上**：且最好跨越一个完整市场周期（牛+熊），当前 1.5 年的测试集碰巧全是牛市，样本量和 regime 覆盖均不足
+4. **用 Walk-Forward 替代固定切分**：滚动扩窗或滑窗，每隔半年重新训练，将多个 test 段结果拼接，统计置信度更高，也能观察策略在不同 regime 下的稳定性
+
+```
+Walk-Forward 示意：
+[──train1──] → test1
+[────train2────] → test2
+[──────train3──────] → test3
+将 test1 + test2 + test3 拼接后评估整体绩效
+```
 
 ### 10.4 数据结构全流程一览
 
@@ -454,16 +511,15 @@ clean_df（预处理后）
 train_df / valid_df / test_df
           ↓  IC 分析（只用 train_df）
 筛选有效因子
-          ↓  等权合成（train + valid 选方法）
-test_score（每行一个综合得分）
-    shape = (test 有效行数,)
-          ↓  nlargest(TOPK) per day
-holdings（每天 Top-30 股票列表）
-    dict{date: [stock1, ...]}
-          ↓  逐日模拟，扣手续费
-ret_df（策略日收益、换手率）
-          ↓  calc_performance
-绩效报告 + outputs/nav_curve.csv
+          ↓  因子合成（在 test_df 上分别生成两路得分）
+test_score_ew  /  test_score_lr
+          ↓  run_backtest()（各调用一次）
+ret_results["等权EW"]  /  ret_results["LR"]
+    列 = [gross_ret, turnover, net_ret]
+          ↓  calc_performance + 基准对比
+绩效报告（EW / LR / 基准并排）
+    + outputs/nav_curve.csv
+    + outputs/ic_analysis.csv
 ```
 
 ### 10.5 下一步学习方向
