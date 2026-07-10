@@ -28,7 +28,6 @@ warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
 from scipy import stats
-from sklearn.linear_model import LinearRegression
 
 import qlib
 from qlib.constant import REG_CN
@@ -223,8 +222,8 @@ if __name__ == "__main__":
     full_df = handler.fetch(col_set=["feature", "label"], data_key=DataHandlerLP.DK_I)
     # 将多级列压平为单级，列名格式 "(feature, MOM_5D)" → "MOM_5D"
     full_df.columns = [col[1] for col in full_df.columns]
-    full_df.index.names = ["instrument", "datetime"]
-    full_df = full_df.swaplevel().sort_index()
+    # Qlib handler 返回 (instrument, datetime) 顺序，reorder_levels 按名字显式调整为 (datetime, instrument)
+    full_df = full_df.reorder_levels(["datetime", "instrument"]).sort_index()
 
     print(f"Handler 全量数据  shape = {full_df.shape}")
     print(f"  索引层级: {full_df.index.names}")
@@ -237,7 +236,7 @@ if __name__ == "__main__":
 
     clean_df = full_df.dropna()
 
-    dt  = clean_df.index.get_level_values("datetime")
+    dt  = pd.to_datetime(clean_df.index.get_level_values("datetime"))
     ins = clean_df.index.get_level_values("instrument")
     in_universe = pd.Series(False, index=clean_df.index)
     for stock, spans in membership_dict.items():
@@ -357,30 +356,22 @@ if __name__ == "__main__":
         print(f"  截距: {lr_model.model.intercept_:.6f}")
 
     # 在 test_df 上生成 LR 预测得分
+    # predict() 返回 Series，索引已是 (datetime, instrument)，直接切片
     pred = lr_model.predict(dataset)
-    # pred 是 DataFrame，索引 (instrument, datetime)，列为 "score"
-    pred.index.names = ["instrument", "datetime"]
-    pred = pred.swaplevel().sort_index()
-    test_score_lr = pred.loc[TEST_START:TEST_END, "score"]
-    # 过滤只保留 test_df 中有的行
+    test_score_lr = pred.loc[TEST_START:TEST_END]
     test_score_lr = test_score_lr.reindex(test_df.index).dropna()
 
     print(f"\n  LR 合成得分 shape (test): {test_score_lr.shape}")
 
     print("\n── 在 valid 集上对比两种合成方式的 IC ──")
-    for method_name, get_score in [
-        ("等权EW", lambda: valid_score_ew),
-        ("LR",     lambda: lr_model.predict(dataset).swaplevel().sort_index().loc[VALID_START:VALID_END, "score"]),
-    ]:
-        s = get_score()
-        if isinstance(s, pd.DataFrame):
-            s = s.iloc[:, 0]
-        s.index.names = ["datetime", "instrument"] if s.index.names[0] != "datetime" else s.index.names
+    # predict() 默认预测 test 段；需传 segment="valid" 取验证集预测
+    valid_score_lr = lr_model.predict(dataset, segment="valid")
+    for method_name, s in [("等权EW", valid_score_ew), ("LR", valid_score_lr)]:
         ic_vals = []
         for date, grp in valid_df.groupby(level="datetime"):
-            dt_vals = s.xs(date, level="datetime") if date in s.index.get_level_values("datetime") else pd.Series()
-            if len(dt_vals) == 0:
+            if date not in s.index.get_level_values("datetime"):
                 continue
+            dt_vals = s.xs(date, level="datetime")
             lb = grp["LABEL"].xs(date, level="datetime").dropna()
             cm = dt_vals.index.intersection(lb.index)
             if len(cm) < 10:
@@ -393,11 +384,11 @@ if __name__ == "__main__":
     # ─────────────────────────────────────────────────────
     # Step 6+7  组合构建 + 回测（与 from_scratch 完全相同）
     # ─────────────────────────────────────────────────────
-    # 重新加载原始收盘价宽表（用于计算日收益率）
+    # 加载原始收盘价宽表：从 TEST_START 前一天开始，保证第一个交易日 pct_change() 不为 NaN
     raw_close = D.features(
         all_stocks,
         fields=["$close"],
-        start_time=TEST_START,
+        start_time=str((pd.Timestamp(TEST_START) - pd.Timedelta(days=5)).date()),
         end_time=TEST_END,
         freq="day",
     )
