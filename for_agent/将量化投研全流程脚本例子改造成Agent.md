@@ -1,0 +1,7 @@
+D:\projects\github\qlib_study\examples\quant_workflow_from_scratch.py这个脚本，是我为了熟悉量化投研，在大模型的帮助下，以qlib的行情数据作为原始数据，手搓的一个全流程脚本，请你阅读并理解。
+D:\projects\github\qlib_study\examples\quant_workflow_from_scratch_tutorial.md这个文档是当时我让大模型帮我总结的一个教程
+
+现在我有一个新的挑战，我希望让某个Agent（我自己基于nanobot搭建的）来自动完成量化投研流程，目的是做到自动化，并且激发Agent里面的大模型（大脑）的一些创新性想法（主要聚焦在因子挖掘和合成等核心环节，当然如果其他环节有新的、有效的想法也可以）。为此，我想先把上面提到的各个脚本，抽象出一些函数，后续作为工具给Agent调用；把一些通用的流程封装成skill；此外，可能还需要把一些人工挖掘的经验也抽象成知识（可能也是skill的形式？或者其他形式）给Agent学习。
+nanobot的开源仓库我下载到本地了：D:\projects\github\official\nanobot，如果有需要你可以去学习它的文档和源码
+
+先制定计划，让我review，然后我再决定是否具体实施哪些措施

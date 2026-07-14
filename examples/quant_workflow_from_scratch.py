@@ -32,7 +32,7 @@ from qlib.data import D
 # ─────────────────────────────────────────────────────────
 # 全局配置
 # ─────────────────────────────────────────────────────────
-PROVIDER_URI = "/Users/guoxing.lan/projects/github/qlib_study/datasets/cn_data"
+PROVIDER_URI = r"D:\projects\github\qlib_study\datasets\cn_data"
 UNIVERSE = "csi300"  # 股票池，沪深300指数成分股；（每半年更新一次）
 
 TRAIN_START = "2015-01-01"
