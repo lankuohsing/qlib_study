@@ -388,50 +388,224 @@ LABEL         shape=(1473, 549)  NaN占比=11.5%
 Skill is valid!
 ```
 
-## 9. 当前未提交变更
+## 9. 已完成：因子预处理/股票池过滤 skill/scripts
 
-当前 git 状态中重要变更：
+用户继续推进相邻流程环节：把原流程中的“因子预处理（每日截面：去极值 → Z-Score）”整理成独立 skill 和可执行脚本。
 
-```text
-M  for_agent/量化投研全流程Agent化改造计划.md
-?? for_agent/quant-price-volume-factor-mining/
-?? for_agent/results/
-?? for_agent/量化投研Agent化改造checkpoint.md
-?? examples/export_raw_ohlcv_to_csv.py
-?? examples/calculator_http_tool_server.py
-?? examples/calculator_http_tool_client.py
-?? examples/calculator_mcp_sdk_server.py
-?? examples/calculator_mcp_sdk_client.py
-?? for_agent/nanobot_workspace/
-```
-
-此外，用户原本已有：
+已新增：
 
 ```text
-examples/quant_workflow_from_scratch.py
+for_agent/quant-factor-preprocessing/
+  SKILL.md
+  scripts/
+    preprocess_cross_sectional_factors.py
 ```
 
-存在修改状态或历史上被提示修改过，但不是本轮新增改造的重点；不要随意回滚用户已有改动。
+定位：
 
-还看到 `.gitignore` 和 `.vscode/launch.json` 在工作区中处于修改状态，这些不是本轮因子 skill 的核心改动，处理前应先确认是否为用户自己的 IDE/配置修改。
-
-## 10. 建议下一步
-
-更贴合当前节奏的下一步是继续“单阶段 skill/scripts 化”，而不是马上进入完整 `quant_agent/` 抽库：
-
-1. 做“因子预处理/股票池过滤” skill/scripts：
-   - 输入：上一步生成的因子长表 CSV.GZ。
-   - 输入：`membership.csv`。
-   - 执行：截面 MAD 去极值、Z-Score 标准化、dropna、成员资格过滤。
-   - 输出：`clean_factor_*.csv.gz`、预览、诊断 JSON。
-2. 该阶段需要开始使用：
+- 这是因子预处理与股票池过滤 skill。
+- 输入是上游因子挖掘阶段生成的因子长表。
+- 输入还包括成员资格表：
 
 ```text
 datasets/exported/raw_ohlcv_csi300_20140601_20200801_membership.csv
 ```
 
-3. 等 Step 2/Step 3 都稳定后，再把共用逻辑抽到 `quant_agent/` 研究库。
-4. 随后再封装 MCP tool。
+- 输出是已经完成截面去极值、截面标准化、缺失值清理、成员资格过滤和时间切分的样本表。
+
+重要设计调整：
+
+- 预处理 skill 不再绑定某一组固定因子名。
+- 因子表必要列只有：
+
+```text
+datetime, instrument, LABEL
+```
+
+- 默认把除 `datetime`、`instrument`、`LABEL` 之外的所有列自动识别为因子列。
+- 如需手动限制处理列，可传：
+
+```powershell
+--factor-cols MOM_5D,MOM_20D,VOL_20D
+```
+
+- 脚本支持无参数直接运行，默认读取当前项目已生成的示例输入：
+
+```text
+for_agent/results/price_volume_ohlcv_factors/price_volume_ohlcv_factors_raw_ohlcv_csi300_20140601_20200801.csv.gz
+datasets/exported/raw_ohlcv_csi300_20140601_20200801_membership.csv
+```
+
+- 换数据集或批量运行时，仍建议显式传入 `--factor-csv` 和 `--membership-csv`。
+
+脚本运行方式：
+
+```powershell
+D:\ProgramData\miniforge3\envs\py312\python.exe for_agent/quant-factor-preprocessing/scripts/preprocess_cross_sectional_factors.py
+```
+
+或显式传参：
+
+```powershell
+D:\ProgramData\miniforge3\envs\py312\python.exe for_agent/quant-factor-preprocessing/scripts/preprocess_cross_sectional_factors.py `
+  --factor-csv for_agent/results/price_volume_ohlcv_factors/price_volume_ohlcv_factors_raw_ohlcv_csi300_20140601_20200801.csv.gz `
+  --membership-csv datasets/exported/raw_ohlcv_csi300_20140601_20200801_membership.csv
+```
+
+默认输出目录：
+
+```text
+for_agent/results/factor_preprocessing/
+```
+
+默认输出文件包括：
+
+```text
+*_clean.csv.gz
+*_train.csv.gz
+*_valid.csv.gz
+*_test.csv.gz
+*_preview.csv
+*_diagnostics.json
+```
+
+已验证正常运行：
+
+```text
+处理前  shape = (808677, 8)  NaN 行数 = 156332
+处理后  shape = (388691, 8)   丢弃了 419986 行
+首个有效日期: 2014-07-01
+末个有效日期: 2020-07-30
+
+train (2015-01-01 ~ 2017-12-31)  shape=(180841, 8)
+valid (2018-01-01 ~ 2018-12-31)  shape=(67735, 8)
+test  (2019-01-01 ~ 2020-08-01)  shape=(105900, 8)
+```
+
+已增强异常处理，方便 Agent 出错时理解：
+
+- `--factor-csv` 或 `--membership-csv` 文件不存在。
+- 输入路径不是文件。
+- CSV 为空。
+- 因子表缺少 `datetime`、`instrument`、`LABEL`，或无法识别任何因子列。
+- `--factor-cols` 指定了输入 CSV 中不存在的列。
+- 成员资格表缺少 `instrument`、`start_time`、`end_time`。
+- 日期无法解析。
+- `train`、`valid`、`test` 任一时间段开始日期晚于结束日期。
+- `train`、`valid`、`test` 时间段互相重叠或顺序不符合先训练、再验证、再测试。
+- `train`、`valid`、`test` 时间段不在清洗后数据日期范围内，或切分后没有可用样本。
+- `--preview-rows` 不是正整数。
+- 输出目录无法创建，或输出路径已存在但不是目录。
+- `--output-prefix` 包含不适合作为文件名的字符。
+- 清洗或成员资格过滤后没有剩余样本。
+
+已运行 skill 校验：
+
+```text
+Skill is valid!
+```
+
+## 10. 两个相邻 skill 的编排判断
+
+当前已经有两个相邻环节：
+
+```text
+quant-price-volume-factor-mining
+  -> 生成未清洗因子长表
+quant-factor-preprocessing
+  -> 读取因子长表 + membership.csv，生成 clean/train/valid/test 样本
+```
+
+如果在 nanobot 中给出足够明确的自然语言指令，理论上可以让 nanobot 自己发现并协调两个 skill 的先后顺序，例如：
+
+```text
+请使用项目里的量化投研技能，先从默认 OHLCV CSV 计算量价/行情类基础因子，
+再对生成的因子表执行因子预处理和股票池过滤。
+请使用默认数据路径，完成后汇报两个阶段的输出文件路径、shape 和 diagnostics 摘要。
+```
+
+但更稳的长期做法是新增一个轻量的“上层流程 skill”，只负责编排，不重复实现计算：
+
+```text
+for_agent/quant-research-workflow/
+  SKILL.md
+```
+
+建议该 workflow skill 规定：
+
+1. 先运行 `quant-price-volume-factor-mining`。
+2. 读取第一阶段输出的 `factor_csv_gz`。
+3. 再运行 `quant-factor-preprocessing`。
+4. 把第一阶段输出路径传给第二阶段的 `--factor-csv`。
+5. 使用 `membership.csv`。
+6. 检查两个阶段的 diagnostics、shape 和输出文件。
+
+暂时不需要 MCP 封装；MCP 更适合等脚本稳定并抽成函数库后再做。
+
+## 11. 当前重要产物与 git 状态提示
+
+当前已经进入 git 跟踪的重要产物包括：
+
+```text
+for_agent/quant-price-volume-factor-mining/SKILL.md
+for_agent/quant-price-volume-factor-mining/scripts/compute_price_volume_ohlcv_factors.py
+for_agent/quant-factor-preprocessing/SKILL.md
+for_agent/quant-factor-preprocessing/scripts/preprocess_cross_sectional_factors.py
+for_agent/量化投研Agent化改造checkpoint.md
+for_agent/量化投研全流程Agent化改造计划.md
+```
+
+当前本轮文档更新后，`git status --short -- <相关文件>` 显示两份文档处于修改状态：
+
+```text
+M  for_agent/量化投研Agent化改造checkpoint.md
+M  for_agent/量化投研全流程Agent化改造计划.md
+```
+
+运行 git 命令时可能出现：
+
+```text
+warning: unable to access 'C:\Users\Administrator/.config/git/ignore': Permission denied
+```
+
+该 warning 来自全局 git ignore 读取权限，不影响本项目文件判断。
+
+注意：
+
+- `for_agent/results/` 下的 CSV.GZ、preview、diagnostics 是脚本运行产物，可能较大；提交前需要确认是否应该进 git。
+- `datasets/exported/` 下的固定 CSV 数据是本地数据快照，按既定原则不应进入 git。
+- 不要随意回滚 `.gitignore`、`.vscode/launch.json`、`examples/quant_workflow_from_scratch.py` 等用户可能自行修改的文件。
+
+## 12. 建议下一步
+
+更贴合当前节奏的下一步有两个可选方向：
+
+方向 A：新增“上层流程 skill”，把当前两个相邻 skill 串起来。
+
+```text
+for_agent/quant-research-workflow/
+  SKILL.md
+```
+
+它应负责告诉 Agent 如何依次运行因子挖掘和因子预处理、如何传递输出路径、如何检查 diagnostics。
+
+方向 B：继续做下一个单阶段 skill/scripts，即“因子有效性分析（IC / ICIR）”。
+
+建议输入：
+
+```text
+for_agent/results/factor_preprocessing/*_train.csv.gz
+```
+
+建议输出：
+
+```text
+ic_analysis.csv
+factor_corr.csv
+diagnostics.json
+```
+
+如果目标是尽快在 nanobot 里端到端跑通前两个阶段，先做方向 A；如果目标是继续沿原脚本拆分，做方向 B。
 
 原计划里的 Milestone A 仍然有效，但可以拆得更细：
 
@@ -451,10 +625,12 @@ datasets/exported/raw_ohlcv_csi300_20140601_20200801_membership.csv
 5. 做“原 Qlib 版本 vs CSV-first 版本”的基线对齐。
 6. 再把稳定函数包装成 `quant_mcp_server.py`，使用官方 MCP Python SDK 的 `FastMCP`。
 
-## 11. 下次继续对话建议开场
+## 13. 下次继续对话建议开场
 
 可以直接说：
 
 ```text
-请阅读 for_agent/量化投研Agent化改造checkpoint.md 和 for_agent/量化投研全流程Agent化改造计划.md，然后继续做“因子预处理/股票池过滤” skill/scripts。
+请阅读 for_agent/量化投研Agent化改造checkpoint.md 和 for_agent/量化投研全流程Agent化改造计划.md。
+我们已经完成“量价/行情类基础因子计算”和“因子预处理/股票池过滤”两个 skill/scripts。
+请继续做一个上层 workflow skill，把这两个阶段串起来；或者继续做“因子有效性分析（IC / ICIR）” skill/scripts。
 ```
