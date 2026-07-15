@@ -1,7 +1,7 @@
 # 量化投研全流程 Agent 化改造计划
 
 > 目标：把现有量化投研脚本从“人手动跑脚本”改造成“Agent 可调用工具 + 可复用 skill + 可沉淀知识”的自动化研究系统。  
-> 当前阶段：已固定原始行情 CSV，并已完成“量价/行情类基础因子计算”“因子预处理/股票池过滤”“因子有效性分析（IC / ICIR）”三个相邻 skill/scripts；下一步建议做上层 workflow skill 或继续拆“因子合成”阶段。
+> 当前阶段：已固定原始行情 CSV，并已完成“量价/行情类基础因子计算”“因子预处理/股票池过滤”“因子有效性分析（IC / ICIR）”“因子合成”四个相邻 skill/scripts；下一步建议做上层 workflow skill 或继续拆“组合构建 + 回测”阶段。
 
 续聊 checkpoint：
 
@@ -53,7 +53,12 @@ raw_df = (
     .set_index(["datetime", "instrument"])
     .sort_index()
 )
+raw_df[["open", "high", "low", "close", "volume"]] = raw_df[
+    ["open", "high", "low", "close", "volume"]
+].astype("float32")
 ```
+
+这里显式转回 `float32` 是当前基线对齐要求。Qlib 原始 `.bin` 读出是 `float32`；如果固定 CSV 被 pandas 默认读成 `float64`，会在 `PRICE_POS = (close - low) / (high - low + 1e-9)` 这类对价格并列值敏感的因子上引入细微差异，进而影响 Spearman IC 的可计算日期数量。
 
 成员资格过滤所需的 `membership_dict` 后续也应从 `raw_ohlcv_csi300_20140601_20200801_membership.csv` 还原，而不是再调用 `D.list_instruments()`。
 
@@ -137,7 +142,7 @@ Skill is valid!
 
 关于多个相邻 skill 的编排判断：
 
-- 短期可以直接在 nanobot 中输入明确指令，让它依次运行量价因子计算、因子预处理和 IC 分析 skill，并把上游输出路径传给下游脚本。
+- 短期可以直接在 nanobot 中输入明确指令，让它依次运行量价因子计算、因子预处理、IC 分析和因子合成 skill，并把上游输出路径传给下游脚本。
 - 长期建议新增一个轻量的上层 workflow skill，只负责编排多个阶段，不重复实现计算。
 - 现阶段仍不急于 MCP 化；等脚本稳定并抽成 `quant_agent/` 函数库后，再封装 MCP tool 更稳。
 
@@ -163,13 +168,70 @@ for_agent/quant-factor-ic-analysis/
 
 ```text
 IC 分析样本段 = 700 个交易日，431 只股票
-MOM_5D     IC均值=-0.0672  ICIR=-0.3055
-MOM_20D    IC均值=-0.0495  ICIR=-0.2199
-VOL_20D    IC均值=-0.0231  ICIR=-0.0913
-TURN_5D    IC均值=-0.0323  ICIR=-0.1980
-MA_DEV     IC均值=-0.0595  ICIR=-0.2544
-DAY_RANGE  IC均值=-0.0557  ICIR=-0.2547
-PRICE_POS  IC均值=-0.0276  ICIR=-0.1470
+MOM_5D     IC均值=-0.0672  IC标准差=0.2200  ICIR=-0.3055  IC>0占比=0.371  计算日数=700
+MOM_20D    IC均值=-0.0495  IC标准差=0.2249  ICIR=-0.2199  IC>0占比=0.404  计算日数=700
+VOL_20D    IC均值=-0.0231  IC标准差=0.2535  ICIR=-0.0913  IC>0占比=0.426  计算日数=700
+TURN_5D    IC均值=-0.0323  IC标准差=0.1631  ICIR=-0.1981  IC>0占比=0.390  计算日数=700
+MA_DEV     IC均值=-0.0595  IC标准差=0.2338  ICIR=-0.2544  IC>0占比=0.407  计算日数=700
+DAY_RANGE  IC均值=-0.0557  IC标准差=0.2187  ICIR=-0.2548  IC>0占比=0.371  计算日数=700
+PRICE_POS  IC均值=-0.0293  IC标准差=0.1858  ICIR=-0.1577  IC>0占比=0.400  计算日数=690
+Skill is valid!
+```
+
+关于 `PRICE_POS` 的一次重要对齐修正：
+
+- 旧 CSV 流水线曾得到 `PRICE_POS IC均值=-0.0276, ICIR=-0.1470, 计算日数=693`。
+- 原始脚本在跳过不可定义 Spearman IC 后得到 `PRICE_POS IC均值=-0.0293, ICIR=-0.1577, 计算日数=690`。
+- 根因不是 IC 分析脚本，而是固定 CSV 读入时 pandas 默认使用 `float64`，打散了 Qlib `float32` 数据中原本相同的 `PRICE_POS` 截面值。
+- 已在 `for_agent/quant-price-volume-factor-mining/scripts/compute_price_volume_ohlcv_factors.py` 中将 OHLCV 列显式转为 `float32`，并重新跑通三阶段。
+- 后续任何 CSV-first 数据入口都应保留这个 dtype 对齐要求，除非重新定义并冻结新的基线。
+
+已完成第四个阶段：
+
+```text
+for_agent/quant-factor-combination/
+  SKILL.md
+  scripts/
+    combine_factor_scores.py
+    combine_equal_weight_scores.py
+    combine_linear_regression_scores.py
+    factor_combination_common.py
+```
+
+该 skill 负责把多个候选因子合成为单一选股得分。当前支持：
+
+```text
+equal_weight
+linear_regression
+```
+
+脚本组织方式：
+
+- `combine_equal_weight_scores.py`：等权合成方法脚本。
+- `combine_linear_regression_scores.py`：LinearRegression 合成方法脚本。
+- `factor_combination_common.py`：公共读取、校验、IC 评估和落盘函数。
+- `combine_factor_scores.py`：轻量批量入口，只负责按 `--methods` 调用具体方法脚本。
+
+这次形成的约定：
+
+- 因子合成作为一个 skill 管理。
+- 每种合成方法用独立方法脚本，方便后续增加 `ic_weighted`、`ridge`、`rolling_ic_weighted` 等方法。
+- `SKILL.md` 主要写 Agent 执行所需的脚本、参数、输入输出和排查方式，不放内部设计辩护；设计取舍记录在 checkpoint 或总计划中。
+
+已验证：
+
+```text
+等权合成:
+  train IC均值=-0.0776  ICIR=-0.3652
+  valid IC均值=-0.0553  ICIR=-0.3051
+  test  IC均值=-0.0402  ICIR=-0.2370
+
+LinearRegression:
+  train IC均值= 0.0413  ICIR= 0.2191
+  valid IC均值= 0.0116  ICIR= 0.0682
+  test  IC均值= 0.0077  ICIR= 0.0481
+  训练集 R²=0.00051
+
 Skill is valid!
 ```
 
@@ -205,12 +267,20 @@ preprocess_cross_sectional_factors.py
 analyze_factor_ic.py
   --input-csv <第二阶段输出的 train_csv_gz>
   --output-dir <输出目录/factor_ic_analysis>
+
+combine_factor_scores.py
+  --train-csv <第二阶段输出的 train_csv_gz>
+  --valid-csv <第二阶段输出的 valid_csv_gz>
+  --test-csv <第二阶段输出的 test_csv_gz>
+  --selected-factors-json <第三阶段输出的 selected_factors_json>
+  --output-dir <输出目录/factor_combination>
 ```
 
 但这属于跨 skill 编排，完全依赖 Agent 临场推理会有不稳定点：
 
 - 第一阶段可能产生多个输出文件，Agent 必须准确选择 `factor_csv_gz`。
-- 第二阶段会产生 `clean/train/valid/test` 多个输出，IC 分析阶段通常应使用 `train_csv_gz`。
+- 第二阶段会产生 `clean/train/valid/test` 多个输出；IC 分析阶段通常应使用 `train_csv_gz`，因子合成阶段应使用 `train_csv_gz`、`valid_csv_gz`、`test_csv_gz`。
+- 第三阶段会产生多个分析产物；因子合成阶段通常应使用 `selected_factors_json`。
 - 用户给的是绝对输出目录时，Agent 需要自行规划子目录，避免不同阶段文件混在一起。
 - 如果 `--output-prefix` 使用自动生成规则，Agent 需要从 stdout 或 diagnostics 中准确读取真实文件路径。
 - 换数据集时，Agent 必须覆盖所有默认参数，不能误用项目内示例默认路径。
@@ -231,7 +301,7 @@ MCP tool
   等函数库和 pipeline 稳定后，再把能力服务化给 nanobot 或团队协作方调用
 ```
 
-短期测试可以直接给 nanobot 一条明确指令，让它自行协调三个 skill。稳定复用时，至少应新增一个 `quant-research-workflow` skill；如果希望进一步降低出错概率，应再新增一个 `run_quant_research_pipeline.py`。
+短期测试可以直接给 nanobot 一条明确指令，让它自行协调四个 skill。稳定复用时，至少应新增一个 `quant-research-workflow` skill；如果希望进一步降低出错概率，应再新增一个 `run_quant_research_pipeline.py`。
 
 ## 0.3 当前数据文件职责边界
 
@@ -271,6 +341,57 @@ raw OHLCV CSV
   -> 成员资格过滤
   -> train/valid/test 切分
 ```
+
+当前已由 `quant-factor-ic-analysis` 承担：
+
+```text
+train 样本
+  -> 每日截面 Spearman IC
+  -> IC/ICIR 汇总
+  -> 候选因子清单 selected_factors.json
+```
+
+当前已由 `quant-factor-combination` 承担：
+
+```text
+train/valid/test 样本 + selected_factors.json
+  -> 等权合成得分
+  -> LinearRegression 合成得分
+  -> 合成得分 IC 对比
+  -> 回归系数和诊断文件
+```
+
+## 0.4 nanobot workspace 同步风险
+
+用户用 nanobot 调用当前 skill 时，曾得到旧版 `PRICE_POS` 结果：
+
+```text
+PRICE_POS  IC均值=-0.0276  IC标准差=0.1874  ICIR=-0.1470  IC>0占比=40.3%  计算日数=693
+```
+
+排查后确认，nanobot 工作路径：
+
+```text
+D:\projects\github\qlib_study\for_agent\nanobot_workspace
+```
+
+里面有独立的 skill 拷贝：
+
+```text
+for_agent/nanobot_workspace/skills/quant-price-volume-factor-mining/
+for_agent/nanobot_workspace/skills/quant-factor-preprocessing/
+for_agent/nanobot_workspace/skills/quant-factor-ic-analysis/
+for_agent/nanobot_workspace/skills/quant-factor-combination/
+```
+
+该拷贝中的 `quant-price-volume-factor-mining/scripts/compute_price_volume_ohlcv_factors.py` 尚未包含主目录最新版的 `float32` 修正，因此 nanobot 结果仍然来自旧流水线。
+
+后续原则：
+
+- 不要默认直接修改 `for_agent/nanobot_workspace`，除非用户明确授权。
+- 如果要验证 nanobot 端结果，需要先同步主目录最新版 skill 到 nanobot workspace。
+- 同步后必须至少重新跑因子计算、因子预处理、IC 分析前三个阶段来确认 `PRICE_POS` 基线；如要验证完整前半流程，还应继续重跑因子合成阶段。
+- 如果 nanobot 结果与离线验证不一致，优先检查 skill 拷贝版本和是否复用了旧输出文件。
 
 ## 1. 我对需求的理解
 
@@ -363,6 +484,7 @@ raw OHLCV CSV
 
 - 从 Qlib 读取的原脚本仍能运行。
 - 从 CSV 读取的新流程能跑出同等结果。
+- CSV-first 流程读取 OHLCV 时显式恢复 `float32`，保证与 Qlib `.bin` 基线对齐。
 - 拆分前后的核心数据 shape、IC 表、回测收益序列在允许误差内一致。
 
 ### Phase 0C：单阶段 skill/scripts 化（进行中）
@@ -377,6 +499,11 @@ raw OHLCV CSV
 - `for_agent/quant-factor-preprocessing/scripts/preprocess_cross_sectional_factors.py`
 - `for_agent/quant-factor-ic-analysis/SKILL.md`
 - `for_agent/quant-factor-ic-analysis/scripts/analyze_factor_ic.py`
+- `for_agent/quant-factor-combination/SKILL.md`
+- `for_agent/quant-factor-combination/scripts/combine_factor_scores.py`
+- `for_agent/quant-factor-combination/scripts/combine_equal_weight_scores.py`
+- `for_agent/quant-factor-combination/scripts/combine_linear_regression_scores.py`
+- `for_agent/quant-factor-combination/scripts/factor_combination_common.py`
 
 已对齐的关键结果：
 
@@ -387,6 +514,9 @@ raw OHLCV CSV
 预处理后 clean shape = (388691, 8)
 train/valid/test shape = (180841, 8) / (67735, 8) / (105900, 8)
 IC 分析样本段 = 700 个交易日，431 只股票
+PRICE_POS IC均值=-0.0293, ICIR=-0.1577, 计算日数=690
+等权合成 train/valid/test IC均值 = -0.0776 / -0.0553 / -0.0402
+LR 合成 train/valid/test IC均值 = 0.0413 / 0.0116 / 0.0077
 Skill is valid!
 ```
 
@@ -399,12 +529,14 @@ Skill is valid!
 - 大结果落盘，屏幕只输出摘要、诊断和产物路径。
 - 预处理阶段不能绑定固定因子名，应能自适应上游因子挖掘结果。
 - IC 分析阶段也不能绑定固定因子名，应能自适应预处理后的因子列。
+- 因子合成阶段应作为一个 skill 管理，但每种合成方法应拆成独立方法脚本，避免单个脚本无限膨胀。
+- `SKILL.md` 应主要放执行说明、参数、输入输出和排查方式；内部设计理由放 checkpoint 或计划文档。
 - 时间切分参数必须严格校验，避免 Agent 在错误日期范围上继续研究。
 
 下一步：
 
-- 可先新建一个轻量的上层 workflow skill，把已完成的三个相邻阶段串起来。
-- 也可继续新建“因子合成”skill/scripts，输入 IC 分析筛选出的候选因子和预处理后的样本。
+- 可先新建一个轻量的上层 workflow skill，把已完成的四个相邻阶段串起来。
+- 也可继续新建“组合构建 + 回测”skill/scripts，输入因子合成阶段输出的测试集得分和原始行情 CSV。
 
 ### Phase 1：把脚本拆成可调用 Python 研究库
 
@@ -466,8 +598,10 @@ qlib_study/
 - 当前已完成量价/行情类基础因子计算 skill/scripts，可作为后续抽库的第一份代码来源。
 - 当前已完成因子预处理/股票池过滤 skill/scripts，可作为后续抽库的第二份代码来源。
 - 当前已完成因子有效性分析（IC / ICIR）skill/scripts，可作为后续抽库的第三份代码来源。
+- 当前已完成因子合成 skill/scripts，可作为后续抽库的第四份代码来源；其中 `factor_combination_common.py` 的公共逻辑可优先沉入 `quant_agent/combine.py` 或 `quant_agent/analysis.py`。
 - 因子预处理逻辑应保持因子列自适应，不要绑定固定因子挖掘假设。
 - IC 分析逻辑也应保持因子列自适应，并把选中因子清单输出为后续因子合成可读取的 JSON。
+- 因子合成逻辑应保留“方法脚本可插拔”的结构，后续新增合成方法时优先增加独立脚本或独立函数，而不是扩张一个巨型脚本。
 - 先覆盖 from_scratch 逻辑，不急着统一 Qlib 版本和 Barra 版本。
 - `quant_workflow_barra.py` 中的优化逻辑可在 Phase 1 后半段拆到 `portfolio.py`。
 
@@ -663,9 +797,9 @@ outputs/runs/<run_id>/
 范围：
 
 - 将数据入口从 Qlib 改为 CSV。
-- 先完成关键阶段的 skill/scripts 化：基础因子计算、因子预处理/股票池过滤、因子有效性分析（IC / ICIR）已完成。
-- 可增加一个轻量 workflow skill 编排当前三个阶段。
-- 下一步继续拆“因子合成”。
+- 先完成关键阶段的 skill/scripts 化：基础因子计算、因子预处理/股票池过滤、因子有效性分析（IC / ICIR）、因子合成已完成。
+- 可增加一个轻量 workflow skill 编排当前四个阶段。
+- 下一步继续拆“组合构建 + 回测”。
 - 再拆分 from_scratch。
 - 原脚本改为调用库。
 - 增加 smoke test。
@@ -777,18 +911,19 @@ outputs/runs/<run_id>/
 方向 A：先补一个轻量 workflow skill。
 
 1. 新建 `for_agent/quant-research-workflow/SKILL.md`。
-2. 编排当前三个相邻阶段：先运行量价/行情类基础因子计算，再运行因子预处理/股票池过滤，最后运行因子有效性分析。
+2. 编排当前四个相邻阶段：先运行量价/行情类基础因子计算，再运行因子预处理/股票池过滤，再运行因子有效性分析，最后运行因子合成。
 3. 明确如何把第一阶段输出的 `factor_csv_gz` 传给第二阶段的 `--factor-csv`。
 4. 明确如何把第二阶段输出的 `train_csv_gz` 传给第三阶段的 `--input-csv`。
-5. 要求检查三个阶段的 diagnostics、shape、输出路径和候选因子 JSON。
+5. 明确如何把第二阶段输出的 `train/valid/test` 三段样本和第三阶段输出的 `selected_factors_json` 传给第四阶段。
+6. 要求检查四个阶段的 diagnostics、shape、输出路径、候选因子 JSON 和合成得分 IC。
 
 方向 B：继续按“单阶段 skill/scripts 化”拆下一个环节。
 
-1. 新建“因子合成”skill。
-2. 编写脚本，输入预处理后的 `train/valid/test` 样本，以及 IC 分析阶段输出的 `selected_factors.json`。
-3. 实现等权因子合成，并准备线性回归合成接口。
-4. 输出合成得分、候选因子清单、合成配置、预览 CSV、诊断 JSON。
-5. 对齐原流程中因子合成阶段的屏幕输出。
+1. 新建“组合构建 + 回测”skill。
+2. 编写脚本，输入因子合成阶段输出的测试集得分，以及原始行情 CSV。
+3. 实现按综合得分每日 Top-K 选股、持仓换手和交易成本扣减。
+4. 输出持仓、日收益、净值曲线、绩效指标、预览 CSV 和诊断 JSON。
+5. 对齐原流程中 Step 6+7 和绩效汇总阶段的屏幕输出。
 
 如果目标是先验证 nanobot 能否串联已完成 skill，选方向 A；如果目标是继续沿原脚本向后拆，选方向 B。
 
