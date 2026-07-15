@@ -227,6 +227,7 @@ __marimo__/
 # 以 outputs / models 为前缀的目录（任意层级，含 outputs、outputs_xxx 等）
 **/outputs*/
 **/models*/
-
+**/results*/
+**/nanobot_workspace*/
 .DS_Store
 **/mlruns/*
