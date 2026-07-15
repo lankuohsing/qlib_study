@@ -320,6 +320,8 @@ if __name__ == "__main__":
             if len(valid) < 10:
                 continue
             ic_val, _ = stats.spearmanr(valid[factor], valid["LABEL"])
+            if pd.isna(ic_val):
+                continue
             ic_list.append(ic_val)
         s = pd.Series(ic_list)
         ic_records[factor] = {
@@ -370,6 +372,8 @@ if __name__ == "__main__":
         if len(cm) < 10:
             continue
         ic_val, _ = stats.spearmanr(sc.loc[cm], lb.loc[cm])
+        if pd.isna(ic_val):
+            continue
         ew_ic_list.append(ic_val)
     ew_ic_s = pd.Series(ew_ic_list)
     print(f"  等权合成 train 段  IC均值={ew_ic_s.mean():.4f}  ICIR={ew_ic_s.mean()/(ew_ic_s.std()+1e-9):.4f}")
@@ -411,6 +415,8 @@ if __name__ == "__main__":
             if len(cm) < 10:
                 continue
             ic_val, _ = stats.spearmanr(sc.loc[cm], lb.loc[cm])
+            if pd.isna(ic_val):
+                continue
             ic_vals.append(ic_val)
         iv = pd.Series(ic_vals)
         print(f"  {method_name:<8}  IC均值={iv.mean():.4f}  ICIR={iv.mean()/(iv.std()+1e-9):.4f}")

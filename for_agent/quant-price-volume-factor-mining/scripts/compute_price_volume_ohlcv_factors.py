@@ -72,6 +72,7 @@ def load_raw_ohlcv(raw_csv: str | Path) -> pd.DataFrame:
         )
 
     raw_df["datetime"] = pd.to_datetime(raw_df["datetime"], errors="raise")
+    raw_df[REQUIRED_COLUMNS] = raw_df[REQUIRED_COLUMNS].astype("float32")
     raw_df = raw_df.set_index(INDEX_COLUMNS).sort_index()
     return raw_df[REQUIRED_COLUMNS]
 

@@ -95,7 +95,12 @@ raw_df = (
     .set_index(["datetime", "instrument"])
     .sort_index()
 )
+raw_df[["open", "high", "low", "close", "volume"]] = raw_df[
+    ["open", "high", "low", "close", "volume"]
+].astype("float32")
 ```
+
+重要：固定 CSV 读回后需要把 OHLCV 列显式转回 `float32`。Qlib 原始 `.bin` 数据读出是 `float32`；如果 CSV 被 pandas 默认读成 `float64`，某些本来完全相同的价格位置值会被微小精度差打散，进而影响 `PRICE_POS` 的 Spearman IC 计算日数。
 
 成员资格过滤应从：
 
