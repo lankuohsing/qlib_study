@@ -40,7 +40,7 @@ from qlib.utils import init_instance_by_config
 # ─────────────────────────────────────────────────────────
 # 全局配置（与 from_scratch 完全一致）
 # ─────────────────────────────────────────────────────────
-PROVIDER_URI = "/Users/guoxing.lan/projects/github/qlib_study/datasets/cn_data"
+PROVIDER_URI = r"D:\projects\github\qlib_study\datasets\cn_data"
 UNIVERSE     = "csi300"
 
 TRAIN_START = "2015-01-01"
@@ -276,6 +276,8 @@ if __name__ == "__main__":
             if len(valid) < 10:
                 continue
             ic_val, _ = stats.spearmanr(valid[factor], valid["LABEL"])
+            if pd.isna(ic_val):
+                continue
             ic_list.append(ic_val)
         s = pd.Series(ic_list)
         ic_records[factor] = {
@@ -323,6 +325,8 @@ if __name__ == "__main__":
         if len(cm) < 10:
             continue
         ic_val, _ = stats.spearmanr(sc.loc[cm], lb.loc[cm])
+        if pd.isna(ic_val):
+            continue
         ew_ic_list.append(ic_val)
     ew_ic_s = pd.Series(ew_ic_list)
     print(f"  等权合成 train 段  IC均值={ew_ic_s.mean():.4f}  ICIR={ew_ic_s.mean()/(ew_ic_s.std()+1e-9):.4f}")
@@ -377,6 +381,8 @@ if __name__ == "__main__":
             if len(cm) < 10:
                 continue
             ic_val, _ = stats.spearmanr(dt_vals.loc[cm], lb.loc[cm])
+            if pd.isna(ic_val):
+                continue
             ic_vals.append(ic_val)
         iv = pd.Series(ic_vals)
         print(f"  {method_name:<8}  IC均值={iv.mean():.4f}  ICIR={iv.mean()/(iv.std()+1e-9):.4f}")
@@ -384,18 +390,19 @@ if __name__ == "__main__":
     # ─────────────────────────────────────────────────────
     # Step 6+7  组合构建 + 回测（与 from_scratch 完全相同）
     # ─────────────────────────────────────────────────────
-    # 加载原始收盘价宽表：从 TEST_START 前一天开始，保证第一个交易日 pct_change() 不为 NaN
+    # 加载原始收盘价宽表：与 from_scratch 保持一致，先切测试期，再计算 pct_change()
     raw_close = D.features(
         all_stocks,
         fields=["$close"],
-        start_time=str((pd.Timestamp(TEST_START) - pd.Timedelta(days=5)).date()),
+        start_time=DATA_START,
         end_time=TEST_END,
         freq="day",
     )
     raw_close.columns = ["close"]
     raw_close.index.names = ["instrument", "datetime"]
     raw_close = raw_close.swaplevel().sort_index()
-    test_ret_wide = raw_close["close"].unstack("instrument").pct_change()
+    close = raw_close["close"].unstack("instrument")
+    test_ret_wide = close.loc[TEST_START:TEST_END].pct_change()
 
     print(f"\n日收益率宽表  shape = {test_ret_wide.shape}")
     print("回测逻辑：T 日因子 → 选出 Top-K 持仓 → T+1 日等权持有 → 扣手续费")
@@ -478,5 +485,6 @@ if __name__ == "__main__":
   预期残余差异：
     - IC 值：预处理差异（MAD clip 前中心点）可能导致因子值略有不同，IC 接近但不完全一致
     - LR 系数：Qlib LinearModel 与 sklearn LR 的数值实现相同，差异来自预处理输入不同
-    - 回测结果：若 IC 分析筛选的 valid_factors 相同，回测结果应完全一致
+    - 回测结果：回测函数与收益率计算口径已对齐；若预处理后的样本日期、股票集合、
+      valid_factors 和合成得分完全一致，回测结果才会完全一致
     """)

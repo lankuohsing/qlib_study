@@ -795,9 +795,9 @@ py_compile OK
 Skill is valid!
 ```
 
-## 14. 四个相邻 skill 的编排判断
+## 14. 相邻 skill 的编排判断
 
-当前已经有四个相邻环节：
+当前已经有五个相邻环节：
 
 ```text
 quant-price-volume-factor-mining
@@ -808,9 +808,11 @@ quant-factor-ic-analysis
   -> 读取 train 样本，生成 IC 汇总、每日 IC、相关矩阵和候选因子清单
 quant-factor-combination
   -> 读取 train/valid/test 样本 + selected_factors.json，生成合成得分
+quant-portfolio-backtest
+  -> 读取 test score + raw OHLCV CSV，生成持仓、日收益、净值曲线和绩效指标
 ```
 
-如果在 nanobot 中给出足够明确的自然语言指令，理论上可以让 nanobot 自己发现并协调四个 skill 的先后顺序。但更稳的长期做法是新增一个轻量的“上层流程 skill”，只负责编排，不重复实现计算：
+如果在 nanobot 中给出足够明确的自然语言指令，理论上可以让 nanobot 自己发现并协调这些 skill 的先后顺序。但更稳的长期做法是新增一个轻量的“上层流程 skill”，只负责编排，不重复实现计算：
 
 ```text
 for_agent/quant-research-workflow/
@@ -828,12 +830,190 @@ for_agent/quant-research-workflow/
 7. 运行 `quant-factor-ic-analysis`，把 `train_csv_gz` 传给 `--input-csv`。
 8. 读取第三阶段输出的 `selected_factors_json`。
 9. 运行 `quant-factor-combination`，把三段样本和 `selected_factors_json` 传给因子合成脚本。
-10. 检查四个阶段的 diagnostics、shape、输出文件、候选因子 JSON 和合成得分 IC。
-11. 对 nanobot workspace，先确认 skill 拷贝已经同步到最新版。
+10. 运行 `quant-portfolio-backtest`，把因子合成阶段输出的 test score 文件传给回测脚本。
+11. 检查各阶段 diagnostics、shape、输出文件、候选因子 JSON、合成得分 IC、回测指标和净值曲线。
+12. 对 nanobot workspace，先确认 skill 拷贝已经同步到最新版。
 
 暂时不需要 MCP 封装；MCP 更适合等脚本稳定并抽成函数库后再做。
 
-## 15. 当前重要产物与 git 状态提示
+## 15. 已完成：组合构建 + 回测 skill/scripts
+
+用户继续推进原脚本中的：
+
+```text
+Step 6+7  组合构建 + 回测（EW 和 LR 各走一遍）
+```
+
+已新增：
+
+```text
+for_agent/quant-portfolio-backtest/
+  SKILL.md
+  scripts/
+    run_topk_portfolio_backtest.py
+```
+
+定位：
+
+- 这是组合构建与教学型简化回测 skill。
+- 输入是一个或多个合成得分文件，以及原始 OHLCV CSV。
+- 与上游因子合成方法解耦：只要得分文件包含 `datetime`、`instrument` 和一个得分列，就可以作为回测输入。
+- 当前默认回测因子合成阶段产出的两个方法：
+
+```text
+equal_weight
+linear_regression
+```
+
+默认输入：
+
+```text
+datasets/exported/raw_ohlcv_csi300_20140601_20200801.csv
+for_agent/results/factor_combination/factor_combination_preprocessed_price_volume_ohlcv_factors_raw_ohlcv_csi300_20140601_20200801_equal_weight_test_score.csv.gz
+for_agent/results/factor_combination/factor_combination_preprocessed_price_volume_ohlcv_factors_raw_ohlcv_csi300_20140601_20200801_linear_regression_test_score.csv.gz
+```
+
+默认输出目录：
+
+```text
+for_agent/results/portfolio_backtest/
+```
+
+默认运行方式：
+
+```powershell
+D:\ProgramData\miniforge3\envs\py312\python.exe for_agent/quant-portfolio-backtest/scripts/run_topk_portfolio_backtest.py
+```
+
+已验证：`run_topk_portfolio_backtest.py` 与 `examples/quant_workflow_from_scratch.py` 的最终绩效结果一致：
+
+```text
+绩效对比（test 期间 2019-01-01 ~ 2020-08-01）
+
+指标                    等权EW              LR          基准（等权）
+年化收益                32.13%          25.02%          46.43%
+年化波动                30.53%          22.90%          22.71%
+夏普比率                  1.05            1.09            2.04
+最大回撤               -20.35%         -22.49%         -14.12%
+累计收益                48.89%          37.58%          72.42%
+```
+
+脚本输出包括：
+
+```text
+*_<method>_holdings.csv.gz
+*_<method>_daily_returns.csv
+*_nav_curve.csv
+*_backtest_metrics.csv
+*_backtest_metrics.json
+*_preview.csv
+*_diagnostics.json
+```
+
+设计约定：
+
+- 本阶段不关心因子合成方法内部逻辑，只消费 test score。
+- 后续新增 `ic_weighted`、`ridge`、`rolling_ic_weighted` 等合成方法时，不需要改回测 skill，只需按 `method=path` 传入新的 score 文件。
+- 本阶段不使用 `LABEL`；回测收益来自原始 OHLCV CSV 的 `close`。
+- 当前回测是教学型简化回测，不含停牌、涨跌停、真实成交价、滑点、容量约束等真实交易细节。
+
+至此，主链路已经完成五个相邻 skill/scripts：
+
+```text
+quant-price-volume-factor-mining
+  -> quant-factor-preprocessing
+  -> quant-factor-ic-analysis
+  -> quant-factor-combination
+  -> quant-portfolio-backtest
+```
+
+## 16. Qlib 对照脚本的最新排查结论
+
+用户对比了三个脚本：
+
+```text
+examples/quant_workflow_from_scratch.py
+for_agent/quant-portfolio-backtest/scripts/run_topk_portfolio_backtest.py
+examples/quant_workflow_qlib.py
+```
+
+当前结论：
+
+- `run_topk_portfolio_backtest.py` 已与 `quant_workflow_from_scratch.py` 对齐。
+- `quant_workflow_qlib.py` 与手写版仍有差异，这是由 Qlib 表达式/Processor/LinearModel 语义和样本日期集合差异共同导致的。
+
+已按“方案 A”对 `examples/quant_workflow_qlib.py` 做了最小修正：
+
+- 三处 Spearman IC 循环增加 `pd.isna(ic_val)` 跳过逻辑。
+- Step 6+7 的收益率窗口改为与 `from_scratch` 一致：先加载 `DATA_START ~ TEST_END` 的 close 宽表，再 `close.loc[TEST_START:TEST_END].pct_change()`。
+- `PROVIDER_URI` 改为 Windows raw string，消除 `invalid escape sequence '\p'` 警告。
+- 脚本末尾说明已更新：回测函数与收益率计算口径已对齐，但如果预处理后的样本日期、股票集合、`valid_factors` 和合成得分不完全一致，回测结果仍不会完全一致。
+
+方案 A 修改后，`quant_workflow_qlib.py` 可完整运行，输出为：
+
+```text
+等权EW: 年化收益 32.64%, 累计收益 51.74%
+LR:     年化收益 22.38%, 累计收益 34.73%
+基准:   年化收益 53.74%, 累计收益 88.69%
+```
+
+与手写版仍不同的关键原因：
+
+```text
+from_scratch 回测日: 360 天，2019-01-02 ~ 2020-07-30
+qlib 回测日:        372 天，2019-01-02 ~ 2020-07-31
+
+Qlib 多出的日期: 16 个
+Qlib 少掉的日期: 4 个
+净多: 12 个
+```
+
+Qlib 多出的日期包括：
+
+```text
+2019-05-07
+2019-05-08
+2019-05-13
+2019-05-14
+2019-05-15
+2019-05-16
+2019-05-17
+2019-05-20
+2019-05-21
+2019-05-22
+2019-05-23
+2019-05-24
+2019-05-27
+2019-05-28
+2019-05-29
+2020-07-31
+```
+
+Qlib 少掉的日期包括：
+
+```text
+2020-01-08
+2020-01-13
+2020-01-14
+2020-02-03
+```
+
+原因解释：
+
+- `2019-04-29` 和 `2019-04-30` 在原始数据中全市场 close/volume 为空。
+- 手写版用 pandas `rolling()`，默认要求窗口内完整观测，因此这两个全市场空日会打断后续滚动窗口。
+- 在 2019-05 上半月，手写版的 `TURN_5D` 或 `MA_DEV` 在若干日期全市场为 NaN，`processed.dropna()` 后这些日期整天被删除。
+- Qlib 表达式引擎和 `CSZScoreNorm` 对 rolling/缺失值的处理语义不同，因此保留了这些日期。
+- `2020-07-31` 是 label 边界问题：手写版固定 CSV 截止到 2020-07-31，最后一天没有下一交易日收益，`LABEL` 全空后被删除；Qlib 的 `Ref($close, -1)` 可能从 provider 中继续向后取数据，因此保留该日。
+
+当前判断：
+
+- 如果目标是复现当前 CSV-first 主链路和 Agent 化 skill/scripts，应以手写版/CSV skill 的 360 个回测日为基准。
+- Qlib 版 372 个回测日不是简单“错误”，而是 Qlib 原生表达式和 Processor 语义导致的不同样本口径。
+- `examples/quant_workflow_qlib.py` 可作为 Qlib 对照演示脚本保留，但不应再作为 Agent 化主链路的对齐基准。
+- 如果未来要求 Qlib 脚本也精确对齐手写版，应进入“方案 B”：Qlib 只负责取原始数据或表达式结果，后续预处理、label 边界、训练样本、回测日期集合均改为显式 pandas/CSV-first 口径。
+
+## 17. 当前重要产物与 git 状态提示
 
 当前已经进入 git 跟踪的重要产物包括：
 
@@ -849,11 +1029,14 @@ for_agent/quant-factor-combination/scripts/combine_factor_scores.py
 for_agent/quant-factor-combination/scripts/combine_equal_weight_scores.py
 for_agent/quant-factor-combination/scripts/combine_linear_regression_scores.py
 for_agent/quant-factor-combination/scripts/factor_combination_common.py
+for_agent/quant-portfolio-backtest/SKILL.md
+for_agent/quant-portfolio-backtest/scripts/run_topk_portfolio_backtest.py
+examples/quant_workflow_qlib.py
 for_agent/量化投研Agent化改造checkpoint.md
 for_agent/量化投研全流程Agent化改造计划.md
 ```
 
-当前本轮文档更新后，`git status --short -- <相关文件>` 会显示两份文档处于修改状态。
+当前本轮文档更新后，`git status --short -- <相关文件>` 会显示两份文档处于修改状态；`examples/quant_workflow_qlib.py` 也包含本轮方案 A 的最小对齐修改。
 
 运行 git 命令时可能出现：
 
@@ -870,48 +1053,30 @@ warning: unable to access 'C:\Users\Administrator/.config/git/ignore': Permissio
 - `for_agent/nanobot_workspace/outputs/` 是 nanobot 运行产物；如果 skill 未同步或复用旧输出，可能出现与主目录离线验证不一致的结果。
 - 不要随意回滚 `.gitignore`、`.vscode/launch.json`、`examples/quant_workflow_from_scratch.py` 等用户可能自行修改的文件。
 
-## 16. 建议下一步
+## 18. 建议下一步
 
 更贴合当前节奏的下一步有两个可选方向：
 
-方向 A：新增“上层流程 skill”，把当前四个相邻 skill 串起来。
+方向 A：新增“上层流程 skill”，把当前五个相邻 skill 串起来。
 
 ```text
 for_agent/quant-research-workflow/
   SKILL.md
 ```
 
-它应负责告诉 Agent 如何依次运行因子挖掘、因子预处理、IC 分析和因子合成，如何传递输出路径，如何检查 diagnostics，以及如何避免 nanobot 使用旧 skill 拷贝或旧中间产物。
+它应负责告诉 Agent 如何依次运行因子挖掘、因子预处理、IC 分析、因子合成和组合回测，如何传递输出路径，如何检查 diagnostics，以及如何避免 nanobot 使用旧 skill 拷贝或旧中间产物。
 
-方向 B：继续做下一个单阶段 skill/scripts，即“组合构建 + 回测”。
+方向 B：把已经完成的五个单阶段 skill/scripts 抽象成 `quant_agent/` 研究库和一个 CSV-first pipeline 入口脚本。
 
-建议输入：
+如果目标是尽快在 nanobot 里稳定端到端跑通完整 CSV-first 基线，先做方向 A；如果目标是减少脚本重复、为 MCP 化打基础，做方向 B。
 
-```text
-for_agent/results/factor_combination/*_equal_weight_test_score.csv.gz
-for_agent/results/factor_combination/*_linear_regression_test_score.csv.gz
-datasets/exported/raw_ohlcv_csi300_20140601_20200801.csv
-```
-
-建议输出：
-
-```text
-holdings_*.csv.gz
-daily_returns_*.csv
-nav_curve_*.csv
-backtest_metrics_*.json
-preview.csv
-```
-
-如果目标是尽快在 nanobot 里稳定端到端跑通前四个阶段，先做方向 A；如果目标是继续沿原脚本拆分，做方向 B。
-
-额外短任务：在用户授权后，把主目录四个 skill 同步到：
+额外短任务：在用户授权后，把主目录五个 skill 同步到：
 
 ```text
 for_agent/nanobot_workspace/skills/
 ```
 
-并清理或隔离旧的 nanobot 输出目录，再重新跑前四个阶段；其中前三阶段应先确认 `PRICE_POS` 变为：
+并清理或隔离旧的 nanobot 输出目录，再重新跑五个阶段；其中前三阶段应先确认 `PRICE_POS` 变为：
 
 ```text
 IC均值=-0.0293  IC标准差=0.1858  ICIR=-0.1577  IC>0占比=0.400  计算日数=690
@@ -935,13 +1100,13 @@ IC均值=-0.0293  IC标准差=0.1858  ICIR=-0.1577  IC>0占比=0.400  计算日�
 5. 做“原 Qlib 版本 vs CSV-first 版本”的基线对齐。
 6. 再把稳定函数包装成 `quant_mcp_server.py`，使用官方 MCP Python SDK 的 `FastMCP`。
 
-## 17. 下次继续对话建议开场
+## 19. 下次继续对话建议开场
 
 可以直接说：
 
 ```text
 请阅读 for_agent/量化投研Agent化改造checkpoint.md 和 for_agent/量化投研全流程Agent化改造计划.md。
-我们已经完成“量价/行情类基础因子计算”“因子预处理/股票池过滤”“因子有效性分析（IC / ICIR）”“因子合成”四个 skill/scripts。
+我们已经完成“量价/行情类基础因子计算”“因子预处理/股票池过滤”“因子有效性分析（IC / ICIR）”“因子合成”“组合构建 + 回测”五个 skill/scripts。
 注意主目录因子计算脚本已经加入 float32 修正，nanobot workspace 里可能仍是旧 skill 拷贝。
-请继续做一个上层 workflow skill，把这四个阶段串起来；或者继续做“组合构建 + 回测” skill/scripts。
+请继续做一个上层 workflow skill，把这五个阶段串起来；或者开始把这些脚本抽象成 quant_agent/ 研究库和 CSV-first pipeline 入口脚本。
 ```
