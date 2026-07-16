@@ -1044,3 +1044,8 @@ outputs/runs/<run_id>/
 6. 生成“Qlib 原始脚本 vs CSV-first 新流程”的对齐说明。
 
 这样做完后，MCP 工具和 skill 都会有明确的、可测试的调用目标。
+
+
+# 端到端输入指令例子
+我有一些行情数据存在D:\projects\github\qlib_study\examples\datasets\exported\raw_ohlcv_csi300_20140601_20200801.csv，请帮我做因子挖掘到回测的全流程，并且划分好训练集（2015-01-01到2017-12-31）、验证集（2018-01-01 到2018-12-31），测试集（2019-01-01到2020-08-01）
+，输出目录为D:\projects\github\qlib_study\for_agent\nanobot_workspace\outputs
