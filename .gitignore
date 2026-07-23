@@ -228,6 +228,10 @@ __marimo__/
 **/outputs*/
 **/models*/
 **/results*/
-**/nanobot_workspace*/
+# nanobot workspace contains per-user runtime state (memory, sessions, etc.).
+# Share only reusable skills; files inside skills still follow the global rules above.
+**/nanobot_workspace/*
+!**/nanobot_workspace/skills/
 .DS_Store
 **/mlruns/*
+*.zip
