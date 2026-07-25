@@ -32,7 +32,7 @@ from qlib.data import D
 # ─────────────────────────────────────────────────────────
 # 全局配置
 # ─────────────────────────────────────────────────────────
-PROVIDER_URI = r"D:\projects\github\qlib_study\datasets\cn_data"
+PROVIDER_URI = r"/Users/guoxing.lan/projects/github/qlib_study/datasets/cn_data"
 UNIVERSE = "csi300"  # 股票池，沪深300指数成分股；（每半年更新一次）
 
 TRAIN_START = "2015-01-01"
@@ -271,25 +271,43 @@ if __name__ == "__main__":
         processed.groupby(level="datetime")[FACTOR_COLS].transform(zscore_cs)
     )
 
-    clean_df = processed.dropna()
+    # 【重要：不能用未来标签筛选当天的可选股票】
+    # LABEL[t] 是 t -> t+1 的收益率，在 t 日生成信号时尚不可知。如果这里直接
+    # processed.dropna()，就会把 LABEL 为 NaN 的股票也删掉：例如某股 t+1 日停牌、
+    # 退市或缺数据，策略却会在 t 日提前避开它，这就是前视偏差。
+    #
+    # 因此先建立“打分数据集”：只要当天的因子都可用，该股票就能参与打分。
+    # 此处依然要求全部候选因子非空，仅保留了原脚本对因子完整性的要求；
+    # 唯一的行为变化是：不再要求未来 LABEL 非空。
+    scoring_df = processed.dropna(subset=FACTOR_COLS)
 
-    # 只保留"当天真正在 CSI300"的行：因子用完整历史算，但选股/回测只考虑指数成员
-    dt  = clean_df.index.get_level_values("datetime")
-    ins = clean_df.index.get_level_values("instrument")
-    in_universe = pd.Series(False, index=clean_df.index)
+    # 只保留"当天真正在 CSI300"的行：因子用完整历史算，但选股/回测只考虑指数成员。
+    # 这个过滤基于 t 日已知的成分股资格，所以可以在打分前使用。
+    dt  = scoring_df.index.get_level_values("datetime")
+    ins = scoring_df.index.get_level_values("instrument")
+    in_universe = pd.Series(False, index=scoring_df.index)
     for stock, spans in membership_dict.items():
         for start, end in spans:
             in_universe |= (ins == stock) & (dt >= start) & (dt <= end)
-    clean_df = clean_df[in_universe]
+    scoring_df = scoring_df[in_universe]
+
+    # “有标签数据集”只用于需要知道正确答案的场景：模型训练和 IC 检验。
+    # 它是 scoring_df 的子集，但不能反过来影响 scoring_df 的股票池。
+    labeled_df = scoring_df.dropna(subset=["LABEL"])
 
     print(f"处理前  shape = {factor_df.shape}  NaN 行数 = {factor_df.isna().any(axis=1).sum()}")
-    print(f"处理后  shape = {clean_df.shape}   丢弃了 {len(factor_df) - len(clean_df)} 行")
-    print(f"  首个有效日期: {clean_df.index.get_level_values('datetime').min().date()}")
-    print(f"  末个有效日期: {clean_df.index.get_level_values('datetime').max().date()}")
+    print(f"可打分  shape = {scoring_df.shape}   只要求因子非空（不查看 LABEL）")
+    print(f"可训练  shape = {labeled_df.shape}   在可打分数据上再要求 LABEL 非空")
+    print(f"  保留了 {scoring_df['LABEL'].isna().sum()} 行‘因子可用、但未来标签缺失’的打分样本")
+    print(f"  首个可打分日期: {scoring_df.index.get_level_values('datetime').min().date()}")
+    print(f"  末个可打分日期: {scoring_df.index.get_level_values('datetime').max().date()}")
 
-    train_df = segment(clean_df, TRAIN_START, TRAIN_END)
-    valid_df = segment(clean_df, VALID_START, VALID_END)
-    test_df  = segment(clean_df, TEST_START,  TEST_END)
+    # 训练需要 X（因子）和 y（LABEL），所以使用 labeled_df。
+    train_df = segment(labeled_df, TRAIN_START, TRAIN_END)
+    # 验证和测试先为所有因子可用的股票打分，不能根据 LABEL 是否存在缩小股票池。
+    # 后面计算验证集 IC 时，才会在“已经生成的得分”和“事后可用的 LABEL”之间取交集。
+    valid_df = segment(scoring_df, VALID_START, VALID_END)
+    test_df  = segment(scoring_df, TEST_START,  TEST_END)
 
     print(f"\n数据三段切分:")
     for name, df, s, e in [("train", train_df, TRAIN_START, TRAIN_END),
