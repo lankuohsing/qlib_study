@@ -102,13 +102,13 @@ def calc_performance(series):
     }
 
 
-def run_backtest(test_score, test_ret_wide):
+def run_backtest(test_score, test_open_wide):
     """
     Step 6+7 合并：给定合成得分，走完组合构建和回测，返回日收益 DataFrame。
 
     test_score    : 测试期合成得分 Series，索引 = (datetime, instrument)
-    test_ret_wide : 测试期日收益率宽表，shape = (交易日, 股票数)
-    返回          : DataFrame，列为 gross_ret / turnover / net_ret，索引为日期
+    test_open_wide: 测试期开盘价宽表，shape = (交易日, 股票数)
+    返回          : DataFrame，记录信号日、入场日、收益、换手和净收益，索引为退出日
     """
     # Step 6：每天取合成得分最高的 TOPK 只股票
     holdings = {}
@@ -116,27 +116,47 @@ def run_backtest(test_score, test_ret_wide):
         top_stocks = grp.xs(date, level="datetime").nlargest(TOPK).index.tolist()
         holdings[date] = top_stocks
 
-    # Step 7：逐日模拟收益
+    # Step 7：逐日模拟收益。
+    # T 日完整行情收盘后才能生成信号，因此最早在 T+1 开盘成交；普通 A 股当天
+    # 买入后不能当天卖出，所以在 T+2 开盘退出或调仓。收益区间必须与 LABEL 一致：
+    # open[T+2] / open[T+1] - 1。
+    trading_dates = pd.DatetimeIndex(test_open_wide.index).sort_values()
+    date_pos = {date: pos for pos, date in enumerate(trading_dates)}
     records  = []
-    prev_set = set()  # 上一天的持仓集合，初始为空
+    prev_set = set()  # 上一个信号对应的实际持仓，初始为空
 
-    for date_T in sorted(holdings.keys()):
-        curr_set   = set(holdings[date_T])   # T 日收盘因子选出的新持仓
-        ret_stocks = list(prev_set) if prev_set else []  # 今天实际持有的是昨天选出的股票
+    for signal_date in sorted(holdings.keys()):
+        pos = date_pos.get(signal_date)
+        # 最后两个信号日没有完整的 T+1 入场价和 T+2 退出价：不建立无法结算的仓位，
+        # 也不收取这笔并未执行的交易成本。
+        if pos is None or pos + 2 >= len(trading_dates):
+            continue
 
-        if date_T in test_ret_wide.index:
-            valid_stocks = [s for s in ret_stocks if s in test_ret_wide.columns]
-            day_rets     = test_ret_wide.loc[date_T, valid_stocks].dropna()
-            # 等权持有，每只股票资金相同，组合收益 = 各股票涨跌幅的算术平均
-            port_ret     = day_rets.mean() if len(day_rets) > 0 else 0.0
-        else:
-            port_ret = 0.0
+        entry_date = trading_dates[pos + 1]  # T+1 开盘
+        exit_date  = trading_dates[pos + 2]  # T+2 开盘
+        curr_set   = set(holdings[signal_date])
+        valid_stocks = [s for s in curr_set if s in test_open_wide.columns]
+        period_rets = (
+            test_open_wide.loc[exit_date, valid_stocks]
+            / test_open_wide.loc[entry_date, valid_stocks]
+            - 1
+        ).dropna()
+        # 等权持有，每只股票资金相同，组合收益 = 各股票开盘到下一开盘收益的算术平均。
+        port_ret = period_rets.mean() if len(period_rets) > 0 else 0.0
 
-        # 换手率 = 调仓只数 / (2 × TOPK)；第一天全仓建仓，换手率 = 1
+        # 在 T+1 开盘从上一组持仓切换到当前目标持仓。
+        # 换手率 = 调仓只数 / (2 × TOPK)；第一次全仓建仓，换手率 = 1。
         turnover = len(curr_set.symmetric_difference(prev_set)) / (2 * TOPK) if prev_set else 1.0
         net_ret  = port_ret - turnover * TRANSACTION_COST
 
-        records.append({"date": date_T, "gross_ret": port_ret, "turnover": turnover, "net_ret": net_ret})
+        records.append({
+            "date": exit_date,
+            "signal_date": signal_date,
+            "entry_date": entry_date,
+            "gross_ret": port_ret,
+            "turnover": turnover,
+            "net_ret": net_ret,
+        })
         prev_set = curr_set
 
     return pd.DataFrame(records).set_index("date")
@@ -202,6 +222,7 @@ if __name__ == "__main__":
     section("Step 2  因子计算（从 OHLCV 手工推导 7 个基础因子）")
     # 将 raw_df 中的各列转换为宽表，其中 instrument 是列，datetime 是行；
     # 宽表上的 shift()/rolling() 可对所有股票并行计算，比 groupby+apply 快很多
+    open_  = raw_df["open"].unstack("instrument")  # 避免使用 open，防止覆盖 Python 内置函数
     close  = raw_df["close"].unstack("instrument")
     high   = raw_df["high"].unstack("instrument")
     low    = raw_df["low"].unstack("instrument")
@@ -227,7 +248,9 @@ if __name__ == "__main__":
     MA_DEV    = close / close.rolling(20).mean() - 1  # 收盘价偏离20日均线的百分比
     DAY_RANGE = (high - low) / close.shift(1)  # 当日振幅：(最高价 - 最低价) / 昨日收盘价
     PRICE_POS = (close - low) / (high - low + 1e-9)  # 收盘价在当日高低区间内的相对位置（0~1）
-    LABEL     = close.shift(-1) / close - 1  # 次日收益率，作为模型的预测目标
+    # T 日收盘生成信号，T+1 开盘买入，T+2 开盘卖出/调仓；该收益区间既避免
+    # 使用已经结束的 T 日收盘价成交，也满足普通 A 股“当日买入、次日才能卖出”。
+    LABEL     = open_.shift(-2) / open_.shift(-1) - 1
 
     print("因子宽表 shape（每个均与 close 相同）:")
     for name, arr in [("MOM_5D", MOM_5D), ("MOM_20D", MOM_20D), ("VOL_20D", VOL_20D),
@@ -284,9 +307,9 @@ if __name__ == "__main__":
     )
 
     # 【重要：不能用未来标签筛选当天的可选股票】
-    # LABEL[t] 是 t -> t+1 的收益率，在 t 日生成信号时尚不可知。如果这里直接
-    # processed.dropna()，就会把 LABEL 为 NaN 的股票也删掉：例如某股 t+1 日停牌、
-    # 退市或缺数据，策略却会在 t 日提前避开它，这就是前视偏差。
+    # LABEL[t] 是 T+1 开盘到 T+2 开盘的未来收益，在 T 日生成信号时尚不可知。
+    # 如果这里直接 processed.dropna()，就会把 LABEL 为 NaN 的股票也删掉：例如
+    # 某股未来停牌、退市或缺数据，策略却会在 T 日提前避开它，这就是前视偏差。
     #
     # 因此先建立“打分数据集”：只要当天的因子都可用，该股票就能参与打分。
     # 此处依然要求全部候选因子非空，仅保留了原脚本对因子完整性的要求；
@@ -325,7 +348,7 @@ if __name__ == "__main__":
     # ─────────────────────────────────────────────────────
     section("Step 4  因子有效性分析（IC / ICIR）")
 
-    print("IC  = Spearman(因子值, 次日收益率)，在每日截面计算，再对时序取统计")
+    print("IC  = Spearman(因子值, T+1开盘至T+2开盘收益率)，在每日截面计算，再对时序取统计")
     print("ICIR = IC均值 / IC标准差")
     print("经验阈值：|IC均值| > 0.03 认为有预测力；ICIR > 0.5 认为稳定\n")
 
@@ -430,7 +453,7 @@ if __name__ == "__main__":
             if date not in s.index.get_level_values("datetime"):
                 continue
             sc = s.xs(date, level="datetime")          # 当天所有股票的合成得分
-            lb = grp["LABEL"].xs(date, level="datetime").dropna()  # 次日收益率
+            lb = grp["LABEL"].xs(date, level="datetime").dropna()  # T+1 开盘至 T+2 开盘收益率
             cm = sc.index.intersection(lb.index)
             if len(cm) < 10:
                 continue
@@ -444,14 +467,14 @@ if __name__ == "__main__":
     # ─────────────────────────────────────────────────────
     # Step 6+7  组合构建 + 回测（EW 和 LR 各走一遍）
     # ─────────────────────────────────────────────────────
-    test_ret_wide = close.loc[TEST_START:TEST_END].pct_change()# 每只股票每天相对前一日收盘价的涨跌幅
-    print(f"\n日收益率宽表  shape = {test_ret_wide.shape}  ({test_ret_wide.shape[0]} 交易日 × {test_ret_wide.shape[1]} 股票)")
-    print("回测逻辑：T 日因子 → 选出 Top-K 持仓 → T+1 日等权持有 → 扣手续费")
+    test_open_wide = open_.loc[TEST_START:TEST_END]
+    print(f"\n开盘价宽表  shape = {test_open_wide.shape}  ({test_open_wide.shape[0]} 交易日 × {test_open_wide.shape[1]} 股票)")
+    print("回测逻辑：T 日收盘生成信号 → T+1 开盘买入 → T+2 开盘卖出/调仓 → 扣手续费")
 
     ret_results = {}
     for method_name, test_score in [("等权EW", test_score_ew), ("LR", test_score_lr)]:
         section(f"Step 6+7  组合构建 + 回测（{method_name}）")
-        ret_df = run_backtest(test_score, test_ret_wide)
+        ret_df = run_backtest(test_score, test_open_wide)
         ret_results[method_name] = ret_df
 
         avg_turnover = ret_df["turnover"].mean()
@@ -464,8 +487,16 @@ if __name__ == "__main__":
     # ─────────────────────────────────────────────────────
     section("绩效汇总对比")
 
-    benchmark_ret = test_ret_wide.mean(axis=1).reindex(
-        ret_results["等权EW"].index).fillna(0)
+    # 基准必须与策略使用完全相同的 T+1 开盘到 T+2 开盘收益区间。
+    # 这里仍沿用原脚本的“股票合集等权”简化基准；严格的当日 CSI300 基准属于后续问题。
+    benchmark_ret = pd.Series({
+        exit_date: (
+            test_open_wide.loc[exit_date]
+            / test_open_wide.loc[row["entry_date"]]
+            - 1
+        ).mean()
+        for exit_date, row in ret_results["等权EW"].iterrows()
+    })
 
     perf = {
         "等权EW": calc_performance(ret_results["等权EW"]["net_ret"]),
