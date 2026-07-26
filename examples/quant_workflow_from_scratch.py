@@ -76,8 +76,12 @@ def segment(df, start, end):
     return df[(d >= start) & (d <= end)]
 
 
-def score_equal_weight(df, factors):
-    return df[factors].mean(axis=1)
+def score_equal_weight(df, factors, directions):
+    """按训练期 IC 方向统一因子含义后等权合成；+1 保持原值，-1 反向。"""
+    aligned_directions = pd.Series(
+        [directions[factor] for factor in factors], index=factors, dtype=float
+    )
+    return df[factors].mul(aligned_directions, axis="columns").mean(axis=1)
 
 
 def score_lr(df, factors, model):
@@ -127,8 +131,8 @@ def run_backtest(test_score, test_open_wide):
 
     for signal_date in sorted(holdings.keys()):
         pos = date_pos.get(signal_date)
-        # 最后两个信号日没有完整的 T+1 入场价和 T+2 退出价：不建立无法结算的仓位，
-        # 也不收取这笔并未执行的交易成本。
+        # 正常情况下行情已比 TEST_END 多加载两个交易日，所有测试信号都能结算；
+        # 这里仍保留防御性检查，避免数据源缺失时建立只有成本、没有收益的仓位。
         if pos is None or pos + 2 >= len(trading_dates):
             continue
 
@@ -154,10 +158,20 @@ def run_backtest(test_score, test_open_wide):
             "signal_date": signal_date,
             "entry_date": entry_date,
             "gross_ret": port_ret,
+            "liquidation_turnover": 0.0,
             "turnover": turnover,
             "net_ret": net_ret,
         })
         prev_set = curr_set
+
+    # 回测采用“期末清仓”口径：最后一个退出日不仅按开盘价计算持仓收益，还将
+    # 剩余股票全部卖成现金，并补计一次卖出成本。若不补这一笔，净值实际上只是
+    # 持仓的市值估值，却会被误写成已经完成退出。
+    if records and prev_set:
+        liquidation_turnover = len(prev_set) / TOPK
+        records[-1]["liquidation_turnover"] = liquidation_turnover
+        records[-1]["turnover"] += liquidation_turnover
+        records[-1]["net_ret"] -= liquidation_turnover * TRANSACTION_COST
 
     return pd.DataFrame(records).set_index("date")
 
@@ -178,6 +192,20 @@ if __name__ == "__main__":
     # 要求已经将数据下载并解压到了PROVIDER_URI； https://github.com/microsoft/qlib#data-preparation
     qlib.init(provider_uri=PROVIDER_URI, region=REG_CN)
 
+    # 信号可以生成到 TEST_END，但最后一个信号还需要 T+1、T+2 两个开盘价才能
+    # 完成买入和退出。因此从 Qlib 交易日历自动取得 TEST_END 之后的两个交易日，
+    # 只把它们作为收益结算缓冲，不允许它们产生新的测试信号。
+    calendar_buffer = pd.DatetimeIndex(D.calendar(
+        start_time=TEST_END,
+        end_time=pd.Timestamp(TEST_END) + pd.Timedelta(days=31),
+        freq="day",
+    ))
+    future_trading_dates = calendar_buffer[calendar_buffer > pd.Timestamp(TEST_END)]
+    if len(future_trading_dates) < 2:
+        raise RuntimeError("TEST_END 之后不足两个交易日，无法结算最后一个测试信号")
+    settlement_end = future_trading_dates[1]
+    print(f"测试信号截止: {TEST_END}  |  结算行情截止: {settlement_end.date()}")
+
     # 两步加载，修复刚入选股票因子 NaN 问题：
     # 若直接传 "csi300" 字符串，Qlib 内部会把每只股票的数据裁剪到其成员资格区间，
     # 导致 shift()/rolling() 在入选前的历史窗口上产生虚假 NaN。
@@ -196,7 +224,7 @@ if __name__ == "__main__":
         all_stocks,
         fields=["$open", "$high", "$low", "$close", "$volume"],
         start_time=DATA_START,
-        end_time=TEST_END,
+        end_time=settlement_end,
         freq="day",
     )
     raw_df.columns = ["open", "high", "low", "close", "volume"]  # 重命名列为原始特征名
@@ -394,13 +422,22 @@ if __name__ == "__main__":
     print("── 方式 A：对有效因子等权平均 ──")
     print(f"  参与合成的因子: {valid_factors}")
 
-    # 注意：这里没有按训练集 IC 符号对因子方向做校正。
-    # 原因：IC 符号在不同市场 regime 下可能翻转（如训练期均值回归、测试期趋势延续），
-    # 用训练集 IC 符号固定校正测试期会引入隐性的 regime 假设，反而使结果更差。
-    # 更稳健的做法是滚动估计 IC 符号，但会增加复杂度，超出本脚本范围。
-    train_score_ew = score_equal_weight(train_df, valid_factors)
-    valid_score_ew = score_equal_weight(valid_df, valid_factors)
-    test_score_ew  = score_equal_weight(test_df,  valid_factors)
+    # valid_factors 是按 |IC| 选择的，所以负 IC 因子同样可能有预测能力，只是方向
+    # 与“因子越大、未来收益越高”相反。等权相加前先将负 IC 因子乘以 -1，使所有
+    # 因子都统一为“校正后数值越大，预期收益越高”。方向只由训练期确定，并固定
+    # 应用于 valid/test，绝不能根据验证期或测试期结果回头调整，否则会产生泄漏。
+    train_ic = ic_table.loc[valid_factors, "IC均值"]
+    factor_directions = pd.Series(
+        np.where(train_ic >= 0, 1.0, -1.0),
+        index=valid_factors,
+    )
+    print("  训练期 IC 决定的因子方向（+1 保持，-1 反向）:")
+    for factor in valid_factors:
+        print(f"    {factor:<12} IC={train_ic[factor]:+.4f}  direction={factor_directions[factor]:+g}")
+
+    train_score_ew = score_equal_weight(train_df, valid_factors, factor_directions)
+    valid_score_ew = score_equal_weight(valid_df, valid_factors, factor_directions)
+    test_score_ew  = score_equal_weight(test_df,  valid_factors, factor_directions)
 
     print(f"  合成得分 shape  train={train_score_ew.shape}  valid={valid_score_ew.shape}  test={test_score_ew.shape}")
     print(f"  含义：每行是一只股票在某交易日的综合得分（分越高越可能上涨）")
@@ -467,7 +504,9 @@ if __name__ == "__main__":
     # ─────────────────────────────────────────────────────
     # Step 6+7  组合构建 + 回测（EW 和 LR 各走一遍）
     # ─────────────────────────────────────────────────────
-    test_open_wide = open_.loc[TEST_START:TEST_END]
+    # 信号仍由 test_df 严格限制在 TEST_END 以内；这里只额外保留两个交易日的
+    # 开盘价，用来结算最后两个信号对应的 T+1 入场和 T+2 退出。
+    test_open_wide = open_.loc[TEST_START:settlement_end]
     print(f"\n开盘价宽表  shape = {test_open_wide.shape}  ({test_open_wide.shape[0]} 交易日 × {test_open_wide.shape[1]} 股票)")
     print("回测逻辑：T 日收盘生成信号 → T+1 开盘买入 → T+2 开盘卖出/调仓 → 扣手续费")
 
@@ -480,6 +519,9 @@ if __name__ == "__main__":
         avg_turnover = ret_df["turnover"].mean()
         print(f"  策略日收益序列  shape={ret_df.shape}")
         print(f"  平均换手率: {avg_turnover:.1%}（每次调仓约换 {avg_turnover*TOPK:.1f} 只）")
+        last_record = ret_df.iloc[-1]
+        print(f"  期末清仓: {ret_df.index[-1].date()}  清仓换手={last_record['liquidation_turnover']:.1%}"
+              f"  清仓成本={last_record['liquidation_turnover'] * TRANSACTION_COST:.2%}")
         print(ret_df.head(5).round(5))
 
     # ─────────────────────────────────────────────────────
