@@ -35,13 +35,13 @@ from qlib.data import D
 PROVIDER_URI = r"/Users/guoxing.lan/projects/github/qlib_study/datasets/cn_data"
 UNIVERSE = "csi300"  # 股票池，沪深300指数成分股；（每半年更新一次）
 
-TRAIN_START = "2015-01-01"
-TRAIN_END   = "2017-12-31"
-VALID_START = "2018-01-01"
-VALID_END   = "2018-12-31"
-TEST_START  = "2019-01-01"
-TEST_END    = "2020-08-01"
-DATA_START  = "2014-06-01"  # 比 TRAIN_START 早约 6 个月，为 rolling 窗口预热
+TRAIN_START = "2010-01-01"
+TRAIN_END   = "2014-12-31"
+VALID_START = "2015-01-01"
+VALID_END   = "2017-12-31"
+TEST_START  = "2018-01-01"
+TEST_END    = "2019-06-01"
+DATA_START  = "2009-06-01"  # 比 TRAIN_START 早约 6 个月，为 rolling 窗口预热
 
 TOPK             = 30
 TRANSACTION_COST = 0.001
