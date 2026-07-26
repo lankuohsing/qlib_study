@@ -263,7 +263,19 @@ if __name__ == "__main__":
     print("  不同因子量纲不同（动量≈0.1，量比≈1~3），不能直接比较或加权。")
     print("  截面操作：对同一天所有股票的因子值统一处理，消除日间差异。\n")
 
-    processed = factor_df.copy()
+    # rolling 因子需要每只股票入选 CSI300 前的历史行情来预热窗口，所以 Step 2
+    # 在完整历史上计算因子；但下面的 MAD 和 Z-Score 是“同一天股票之间”的截面
+    # 比较，只能让当天真实的 CSI300 成分股参与，否则尚未入选或已经退出的股票
+    # 会改变当天的中位数、MAD、均值和标准差。
+    dt  = factor_df.index.get_level_values("datetime")
+    ins = factor_df.index.get_level_values("instrument")
+    in_universe = pd.Series(False, index=factor_df.index)
+    for stock, spans in membership_dict.items():  # 判断每只股票在每个交易日是否属于 CSI300
+        for start, end in spans:
+            in_universe |= (ins == stock) & (dt >= start) & (dt <= end)
+
+    # 先按日期过滤当日成分股，再仅在这些股票内部执行截面预处理。
+    processed = factor_df[in_universe].copy()
     processed[FACTOR_COLS] = (
         processed.groupby(level="datetime")[FACTOR_COLS].transform(winsorize_cs)
     )
@@ -280,16 +292,6 @@ if __name__ == "__main__":
     # 此处依然要求全部候选因子非空，仅保留了原脚本对因子完整性的要求；
     # 唯一的行为变化是：不再要求未来 LABEL 非空。
     scoring_df = processed.dropna(subset=FACTOR_COLS)
-
-    # 只保留"当天真正在 CSI300"的行：因子用完整历史算，但选股/回测只考虑指数成员。
-    # 这个过滤基于 t 日已知的成分股资格，所以可以在打分前使用。
-    dt  = scoring_df.index.get_level_values("datetime")
-    ins = scoring_df.index.get_level_values("instrument")
-    in_universe = pd.Series(False, index=scoring_df.index)
-    for stock, spans in membership_dict.items():
-        for start, end in spans:
-            in_universe |= (ins == stock) & (dt >= start) & (dt <= end)
-    scoring_df = scoring_df[in_universe]
 
     # “有标签数据集”只用于需要知道正确答案的场景：模型训练和 IC 检验。
     # 它是 scoring_df 的子集，但不能反过来影响 scoring_df 的股票池。
