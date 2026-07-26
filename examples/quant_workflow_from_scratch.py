@@ -106,72 +106,261 @@ def calc_performance(series):
     }
 
 
-def run_backtest(test_score, test_open_wide):
+def run_backtest(test_score, test_open_wide, test_volume_wide):
     """
-    Step 6+7 合并：给定合成得分，走完组合构建和回测，返回日收益 DataFrame。
+    Step 6+7 合并：按开盘价逐日维护实际持仓、现金和冻结持仓。
 
     test_score    : 测试期合成得分 Series，索引 = (datetime, instrument)
     test_open_wide: 测试期开盘价宽表，shape = (交易日, 股票数)
-    返回          : DataFrame，记录信号日、入场日、收益、换手和净收益，索引为退出日
+    test_volume_wide: 测试期成交量宽表，用于识别零成交量的不可交易日
+    返回          : DataFrame，每行是一个开盘到次日开盘的账户收益区间
+
+    简化成交规则：
+    - 有限且大于 0 的开盘价可用于估值；否则沿用最后一个有效价。
+    - 只有开盘价有效且成交量 > 0 时才允许交易。
+    - 买入失败时资金留在现金；卖出失败时仓位继续持有并冻结。
+    - 手续费只对实际成交金额收取。
     """
-    # Step 6：每天取合成得分最高的 TOPK 只股票
-    holdings = {}
+    # Step 6：每个信号日取合成得分最高的 TOPK 只股票。
+    # test_score 在上游已经按 membership_dict 过滤，因此成分股资格只决定
+    # “想买什么”，不被误用为“当天能否成交”的判断。
+    targets_by_signal = {}
     for date, grp in test_score.groupby(level="datetime"):
         top_stocks = grp.xs(date, level="datetime").nlargest(TOPK).index.tolist()
-        holdings[date] = top_stocks
+        targets_by_signal[pd.Timestamp(date)] = top_stocks
 
-    # Step 7：逐日模拟收益。
+    # Step 7：将 T 日信号安排到 T+1 开盘执行。
     # T 日完整行情收盘后才能生成信号，因此最早在 T+1 开盘成交；普通 A 股当天
     # 买入后不能当天卖出，所以在 T+2 开盘退出或调仓。收益区间必须与 LABEL 一致：
     # open[T+2] / open[T+1] - 1。
     trading_dates = pd.DatetimeIndex(test_open_wide.index).sort_values()
     date_pos = {date: pos for pos, date in enumerate(trading_dates)}
-    records  = []
-    prev_set = set()  # 上一个信号对应的实际持仓，初始为空
-
-    for signal_date in sorted(holdings.keys()):
+    execution_schedule = {}
+    for signal_date, target_stocks in sorted(targets_by_signal.items()):
         pos = date_pos.get(signal_date)
-        # 正常情况下行情已比 TEST_END 多加载两个交易日，所有测试信号都能结算；
-        # 这里仍保留防御性检查，避免数据源缺失时建立只有成本、没有收益的仓位。
         if pos is None or pos + 2 >= len(trading_dates):
             continue
+        execution_schedule[trading_dates[pos + 1]] = (signal_date, target_stocks)
 
-        entry_date = trading_dates[pos + 1]  # T+1 开盘
-        exit_date  = trading_dates[pos + 2]  # T+2 开盘
-        curr_set   = set(holdings[signal_date])
-        valid_stocks = [s for s in curr_set if s in test_open_wide.columns]
-        period_rets = (
-            test_open_wide.loc[exit_date, valid_stocks]
-            / test_open_wide.loc[entry_date, valid_stocks]
-            - 1
-        ).dropna()
-        # 等权持有，每只股票资金相同，组合收益 = 各股票开盘到下一开盘收益的算术平均。
-        port_ret = period_rets.mean() if len(period_rets) > 0 else 0.0
+    if not execution_schedule:
+        return pd.DataFrame()
 
-        # 在 T+1 开盘从上一组持仓切换到当前目标持仓。
-        # 换手率 = 调仓只数 / (2 × TOPK)；第一次全仓建仓，换手率 = 1。
-        turnover = len(curr_set.symmetric_difference(prev_set)) / (2 * TOPK) if prev_set else 1.0
-        net_ret  = port_ret - turnover * TRANSACTION_COST
+    records = []
+    actual_holdings = {}       # instrument -> 实际持有的股数（允许小数股）
+    last_valid_prices = {}     # 用于缺价时估值，不代表当天可成交
+    cash = 1.0                 # 从 1 元初始净值开始，股数按比例计算
+    active_interval = None
 
-        records.append({
-            "date": exit_date,
-            "signal_date": signal_date,
-            "entry_date": entry_date,
-            "gross_ret": port_ret,
-            "liquidation_turnover": 0.0,
-            "turnover": turnover,
-            "net_ret": net_ret,
-        })
-        prev_set = curr_set
+    def market_state(date):
+        """返回当日估值价、可交易状态，并更新最后有效估值价。"""
+        open_row = test_open_wide.loc[date]
+        volume_row = test_volume_wide.loc[date]
+        valid_price = open_row.notna() & np.isfinite(open_row) & (open_row > 0)
+        tradable = valid_price & volume_row.notna() & np.isfinite(volume_row) & (volume_row > 0)
+        last_valid_prices.update(open_row[valid_price].to_dict())
+        return open_row, tradable
 
-    # 回测采用“期末清仓”口径：最后一个退出日不仅按开盘价计算持仓收益，还将
-    # 剩余股票全部卖成现金，并补计一次卖出成本。若不补这一笔，净值实际上只是
-    # 持仓的市值估值，却会被误写成已经完成退出。
-    if records and prev_set:
-        liquidation_turnover = len(prev_set) / TOPK
-        records[-1]["liquidation_turnover"] = liquidation_turnover
-        records[-1]["turnover"] += liquidation_turnover
-        records[-1]["net_ret"] -= liquidation_turnover * TRANSACTION_COST
+    def account_value():
+        """按最后有效价格计算现金 + 持仓市值。"""
+        stock_value = sum(
+            shares * last_valid_prices[stock]
+            for stock, shares in actual_holdings.items()
+            if stock in last_valid_prices
+        )
+        return cash + stock_value
+
+    def rebalance(target_stocks, open_row, tradable):
+        """卖出优先、再按可用现金比例买入；返回实际成交和账户状态。"""
+        nonlocal cash
+        target_stocks = list(dict.fromkeys(target_stocks))
+        nav_before = account_value()
+        target_value = nav_before / len(target_stocks) if target_stocks else 0.0
+        target_set = set(target_stocks)
+        gross_sell = 0.0
+        gross_buy = 0.0
+        unfilled_sells = set()
+        unfilled_buys = set()
+
+        # 先减少超过目标的持仓。当日不可交易时，股数原样保留。
+        for stock, shares in list(actual_holdings.items()):
+            price = last_valid_prices.get(stock)
+            if price is None:
+                continue
+            desired_value = target_value if stock in target_set else 0.0
+            current_value = shares * price
+            sell_value = max(current_value - desired_value, 0.0)
+            if sell_value <= 1e-14:
+                continue
+            if not bool(tradable.get(stock, False)):
+                unfilled_sells.add(stock)
+                continue
+            trade_price = float(open_row[stock])
+            sell_shares = min(shares, sell_value / trade_price)
+            filled_value = sell_shares * trade_price
+            actual_holdings[stock] = shares - sell_shares
+            if actual_holdings[stock] <= 1e-14:
+                del actual_holdings[stock]
+            gross_sell += filled_value
+            cash += filled_value * (1.0 - TRANSACTION_COST)
+
+        # 再汇总所有买入需求。若现金不足，对可成交买单等比例缩放，
+        # 避免由遍历顺序决定哪只股票先获得资金。
+        requested_buys = {}
+        for stock in target_stocks:
+            price = last_valid_prices.get(stock)
+            current_value = actual_holdings.get(stock, 0.0) * price if price is not None else 0.0
+            buy_value = max(target_value - current_value, 0.0)
+            if buy_value <= 1e-14:
+                continue
+            if not bool(tradable.get(stock, False)):
+                unfilled_buys.add(stock)
+                continue
+            requested_buys[stock] = buy_value
+
+        requested_total = sum(requested_buys.values())
+        affordable_total = cash / (1.0 + TRANSACTION_COST)
+        buy_scale = min(1.0, affordable_total / requested_total) if requested_total > 0 else 0.0
+        # 现金不足时按比例成交，其中包括为手续费预留的微小缩放。
+        # unfilled_buy_count 只统计因当日不可交易而完全无法下单的股票，
+        # 避免把正常的资金约束误报成停牌或缺价。
+        for stock, requested_value in requested_buys.items():
+            filled_value = requested_value * buy_scale
+            if filled_value <= 1e-14:
+                continue
+            trade_price = float(open_row[stock])
+            actual_holdings[stock] = actual_holdings.get(stock, 0.0) + filled_value / trade_price
+            gross_buy += filled_value
+            cash -= filled_value * (1.0 + TRANSACTION_COST)
+
+        # 浮点误差可能产生极小负现金，但不允许它演变成隐式融资。
+        if -1e-12 < cash < 0:
+            cash = 0.0
+
+        nav_after = account_value()
+        frozen = [
+            stock for stock in actual_holdings
+            if not bool(tradable.get(stock, False))
+        ]
+        frozen_value = sum(
+            actual_holdings[stock] * last_valid_prices[stock]
+            for stock in frozen
+            if stock in last_valid_prices
+        )
+        base = nav_before if nav_before > 0 else np.nan
+        transaction_cost_amount = (gross_buy + gross_sell) * TRANSACTION_COST
+        return {
+            "nav_before": nav_before,
+            "nav_after": nav_after,
+            "gross_buy": gross_buy,
+            "gross_sell": gross_sell,
+            "buy_turnover": gross_buy / base,
+            "sell_turnover": gross_sell / base,
+            # 保留“单边换手”的直观口径：纯建仓或纯清仓为 100%，
+            # 整仓换股也约为 100%。成本则仍按买卖实际成交额分别收取。
+            "turnover": max(gross_buy, gross_sell) / base,
+            # 输出的成本是相对调仓前净值的比例，可与当日收益率直接对照。
+            "transaction_cost": transaction_cost_amount / base,
+            "cash_weight": cash / nav_after if nav_after > 0 else np.nan,
+            "frozen_count": len(frozen),
+            "frozen_weight": frozen_value / nav_after if nav_after > 0 else np.nan,
+            "unfilled_buy_count": len(unfilled_buys),
+            "unfilled_sell_count": len(unfilled_sells),
+        }
+
+    first_entry = min(execution_schedule)
+    # 最后一次目标在 entry 开盘调仓，再持有到下一个开盘结算。
+    last_entry_pos = date_pos[max(execution_schedule)]
+    final_settlement = trading_dates[last_entry_pos + 1]
+    simulation_dates = trading_dates[
+        (trading_dates >= first_entry) & (trading_dates <= final_settlement)
+    ]
+
+    for date in simulation_dates:
+        open_row, tradable = market_state(date)
+        nav_at_open = account_value()
+
+        # 先用当日开盘价结束上一个 open-to-open 区间，再执行新信号。
+        # 这保证 T 日信号仍然只计算 T+1 开盘到 T+2 开盘的收益。
+        if active_interval is not None:
+            gross_pnl = nav_at_open - active_interval["nav_after"]
+            record = {
+                "date": date,
+                "signal_date": active_interval["signal_date"],
+                "entry_date": active_interval["entry_date"],
+                "gross_ret": gross_pnl / active_interval["nav_before"],
+                "net_ret": (nav_at_open - active_interval["nav_before"]) / active_interval["nav_before"],
+                "liquidation_turnover": 0.0,
+                **active_interval["trade_stats"],
+            }
+            records.append(record)
+
+        if date in execution_schedule:
+            signal_date, target_stocks = execution_schedule[date]
+            trade_stats = rebalance(target_stocks, open_row, tradable)
+            active_interval = {
+                "signal_date": signal_date,
+                "entry_date": date,
+                "nav_before": trade_stats["nav_before"],
+                "nav_after": trade_stats["nav_after"],
+                "trade_stats": {
+                    key: value for key, value in trade_stats.items()
+                    if key not in {"nav_before", "nav_after", "gross_buy", "gross_sell"}
+                },
+                "gross_buy": trade_stats["gross_buy"],
+                "gross_sell": trade_stats["gross_sell"],
+            }
+        elif date < final_settlement:
+            # 若某个交易日因数据不足没有新信号，不能让账户收益从
+            # 时间序列中消失；继续持有原仓位，并开启下一日收益区间。
+            nav = account_value()
+            frozen = [stock for stock in actual_holdings if not bool(tradable.get(stock, False))]
+            frozen_value = sum(
+                actual_holdings[stock] * last_valid_prices[stock]
+                for stock in frozen if stock in last_valid_prices
+            )
+            active_interval = {
+                "signal_date": pd.NaT,
+                "entry_date": date,
+                "nav_before": nav,
+                "nav_after": nav,
+                "trade_stats": {
+                    "buy_turnover": 0.0,
+                    "sell_turnover": 0.0,
+                    "turnover": 0.0,
+                    "transaction_cost": 0.0,
+                    "cash_weight": cash / nav if nav > 0 else np.nan,
+                    "frozen_count": len(frozen),
+                    "frozen_weight": frozen_value / nav if nav > 0 else np.nan,
+                    "unfilled_buy_count": 0,
+                    "unfilled_sell_count": 0,
+                },
+                "gross_buy": 0.0,
+                "gross_sell": 0.0,
+            }
+
+    # 最后一个 T+2 开盘尝试清仓。只有当日真正可交易的持仓才会卖出；
+    # 无法卖出的持仓仍按最后有效价估值，并在输出中明确披露，不伪装成现金。
+    if records:
+        final_open_row, final_tradable = market_state(final_settlement)
+        nav_before_liquidation = account_value()
+        liquidation = rebalance([], final_open_row, final_tradable)
+        last = records[-1]
+        interval_base = active_interval["nav_before"]
+        last["liquidation_turnover"] = (
+            liquidation["gross_sell"] / nav_before_liquidation
+            if nav_before_liquidation > 0 else np.nan
+        )
+        last["sell_turnover"] += liquidation["gross_sell"] / interval_base
+        last["turnover"] = max(last["buy_turnover"], last["sell_turnover"])
+        liquidation_cost_amount = (
+            liquidation["gross_buy"] + liquidation["gross_sell"]
+        ) * TRANSACTION_COST
+        last["transaction_cost"] += liquidation_cost_amount / interval_base
+        last["net_ret"] = (liquidation["nav_after"] - interval_base) / interval_base
+        last["cash_weight"] = liquidation["cash_weight"]
+        last["frozen_count"] = liquidation["frozen_count"]
+        last["frozen_weight"] = liquidation["frozen_weight"]
+        last["unfilled_sell_count"] += liquidation["unfilled_sell_count"]
 
     return pd.DataFrame(records).set_index("date")
 
@@ -507,21 +696,26 @@ if __name__ == "__main__":
     # 信号仍由 test_df 严格限制在 TEST_END 以内；这里只额外保留两个交易日的
     # 开盘价，用来结算最后两个信号对应的 T+1 入场和 T+2 退出。
     test_open_wide = open_.loc[TEST_START:settlement_end]
+    test_volume_wide = volume.loc[TEST_START:settlement_end]
     print(f"\n开盘价宽表  shape = {test_open_wide.shape}  ({test_open_wide.shape[0]} 交易日 × {test_open_wide.shape[1]} 股票)")
-    print("回测逻辑：T 日收盘生成信号 → T+1 开盘买入 → T+2 开盘卖出/调仓 → 扣手续费")
+    print("回测逻辑：T 日收盘生成信号 → T+1 开盘按可成交性买入 → "
+          "T+2 开盘卖出/调仓 → 只对实际成交额扣手续费")
 
     ret_results = {}
     for method_name, test_score in [("等权EW", test_score_ew), ("LR", test_score_lr)]:
         section(f"Step 6+7  组合构建 + 回测（{method_name}）")
-        ret_df = run_backtest(test_score, test_open_wide)
+        ret_df = run_backtest(test_score, test_open_wide, test_volume_wide)
         ret_results[method_name] = ret_df
 
         avg_turnover = ret_df["turnover"].mean()
         print(f"  策略日收益序列  shape={ret_df.shape}")
-        print(f"  平均换手率: {avg_turnover:.1%}（每次调仓约换 {avg_turnover*TOPK:.1f} 只）")
+        print(f"  平均实际换手率: {avg_turnover:.1%}（只统计真正成交的金额）")
+        print(f"  未成交买入: {ret_df['unfilled_buy_count'].sum()} 只次  |  "
+              f"未成交卖出: {ret_df['unfilled_sell_count'].sum()} 只次")
         last_record = ret_df.iloc[-1]
         print(f"  期末清仓: {ret_df.index[-1].date()}  清仓换手={last_record['liquidation_turnover']:.1%}"
-              f"  清仓成本={last_record['liquidation_turnover'] * TRANSACTION_COST:.2%}")
+              f"  清仓后现金权重={last_record['cash_weight']:.1%}"
+              f"  剩余冻结持仓={int(last_record['frozen_count'])} 只")
         print(ret_df.head(5).round(5))
 
     # ─────────────────────────────────────────────────────
