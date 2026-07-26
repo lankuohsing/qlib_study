@@ -46,6 +46,23 @@ DATA_START  = "2009-06-01"  # 比 TRAIN_START 早约 6 个月，为 rolling 窗�
 TOPK             = 30
 TRANSACTION_COST = 0.001
 
+# TopK 排名缓冲：已经持有的股票只要仍位于前 TOPK + 5 名，就优先继续持有。
+# 例如某股票从第 29 名滑到第 32 名时，不会仅因很小的排名波动立刻卖掉；
+# 只有跌出前 35 名后才会让位给排名更高的新股票。该参数只使用当日模型得分，
+# 不会查看未来真实收益。
+TOPK_RANK_BUFFER = 5
+
+# LR 的输出与 LABEL 单位相同，都是 T+1 开盘到 T+2 开盘的预测收益率，因此
+# 可以和交易成本比较。新建一笔仓位最终至少涉及一次买入和一次卖出，0.1%
+# 的单边成本对应 0.2% 的往返成本；这里再留 0.1% 安全余量，要求预测收益
+# 至少达到 0.3% 才允许新买。安全余量是事先固定的配置，不根据 test 表现调参。
+LR_COST_SAFETY_MARGIN = 0.001
+LR_MIN_BUY_PREDICTION = 2 * TRANSACTION_COST + LR_COST_SAFETY_MARGIN
+
+# 已持有股票若预测收益仍为正，可以在排名缓冲范围内继续持有，因为“不卖也不买”
+# 不会在本次调仓新增交易成本。若预测收益转负，则不再仅靠缓冲强行保留。
+LR_MIN_HOLD_PREDICTION = 0.0
+
 FACTOR_COLS = ["MOM_5D", "MOM_20D", "VOL_20D", "TURN_5D", "MA_DEV", "DAY_RANGE", "PRICE_POS"]
 
 # ─────────────────────────────────────────────────────────
@@ -128,6 +145,10 @@ def run_backtest(
     test_volume_wide,
     topk=TOPK,
     membership_by_date=None,
+    rank_buffer=0,
+    min_buy_score=None,
+    min_hold_score=None,
+    simulation_end=None,
 ):
     """
     Step 6+7 合并：按开盘价逐日维护实际持仓、现金和冻结持仓。
@@ -137,6 +158,10 @@ def run_backtest(
     test_volume_wide: 测试期成交量宽表，用于识别零成交量的不可交易日
     topk         : 选取得分最高的股票数；None 表示选取当日全部候选股
     membership_by_date: {date: set(stocks)}，在实际成交日再校验成分资格
+    rank_buffer  : 已持仓股票可继续保留到 topk + rank_buffer 名，减少临界排名换仓
+    min_buy_score: 新买股票必须达到的最低得分；None 表示不设绝对得分门槛
+    min_hold_score: 已持仓股票进入排名缓冲区的最低得分；None 表示不设门槛
+    simulation_end: 统一回测结算日；用于在末段缺少新信号时继续记录持仓收益
     返回          : DataFrame，每行是一个开盘到次日开盘的账户收益区间
 
     简化成交规则：
@@ -168,11 +193,10 @@ def run_backtest(
             current_members = membership_by_date.get(entry_date, set())
             scores = scores[scores.index.isin(current_members)]
 
-        if topk is None:
-            target_stocks = scores.index.tolist()
-        else:
-            target_stocks = scores.nlargest(topk).index.tolist()
-        execution_schedule[entry_date] = (signal_date, target_stocks)
+        # 此时只保存当日可用得分，不立刻确定最终持仓。最终选股必须等到 T+1
+        # 开盘、知道账户实际持有哪些股票时再做，排名缓冲才能正确识别“老持仓”。
+        # 这里使用的是 T 日已生成的分数，不包含任何 T+1 之后的信息。
+        execution_schedule[entry_date] = (signal_date, scores.dropna().sort_values(ascending=False))
 
     if not execution_schedule:
         return pd.DataFrame()
@@ -182,6 +206,63 @@ def run_backtest(
     last_valid_prices = {}     # 用于缺价时估值，不代表当天可成交
     cash = 1.0                 # 从 1 元初始净值开始，股数按比例计算
     active_interval = None
+
+    def select_target_stocks(scores):
+        """根据当日分数、绝对门槛和已有持仓生成目标股票列表。
+
+        EW 分数只是截面标准分，没有“预测收益率”的单位，因此 EW 只使用排名
+        缓冲，绝不能拿它和 0.1% 手续费直接比较。LR 分数则是收益率预测，可以
+        额外设置 min_buy_score/min_hold_score。
+        """
+        scores = scores.dropna().sort_values(ascending=False)
+        if topk is None:
+            return scores.index.tolist(), {
+                "score_count": len(scores),
+                "buy_qualified_count": len(scores),
+                "selected_count": len(scores),
+                "retained_count": 0,
+                "threshold_rejected_count": 0,
+            }
+
+        # 新股票需通过买入门槛。EW 的 min_buy_score=None，所有股票都通过；
+        # LR 则只允许预期收益足够覆盖往返成本和安全余量的股票进入候选集。
+        if min_buy_score is None:
+            buy_qualified = scores
+        else:
+            buy_qualified = scores[scores >= min_buy_score]
+
+        # 排名从 1 开始。老持仓在缓冲排名以内、且达到持有门槛时优先保留。
+        # 这只减少由第 30/31 名来回波动造成的无意义换仓，不会扩大总持仓上限。
+        ranks = pd.Series(np.arange(1, len(scores) + 1), index=scores.index)
+        hold_rank_limit = topk + max(int(rank_buffer), 0)
+        retained = []
+        for stock in actual_holdings:
+            if stock not in scores.index or ranks[stock] > hold_rank_limit:
+                continue
+            if min_hold_score is not None and scores[stock] < min_hold_score:
+                continue
+            retained.append(stock)
+        retained.sort(key=lambda stock: ranks[stock])
+        retained = retained[:topk]
+
+        # 先保留符合缓冲规则的老持仓，再从通过买入门槛的高分股票中补足 TopK。
+        # 若合格股票不足 TopK，不降低门槛硬凑数量，空出的资金槽位留作现金。
+        target_stocks = list(retained)
+        target_set = set(target_stocks)
+        for stock in buy_qualified.index:
+            if len(target_stocks) >= topk:
+                break
+            if stock not in target_set:
+                target_stocks.append(stock)
+                target_set.add(stock)
+
+        return target_stocks, {
+            "score_count": len(scores),
+            "buy_qualified_count": len(buy_qualified),
+            "selected_count": len(target_stocks),
+            "retained_count": len(retained),
+            "threshold_rejected_count": len(scores) - len(buy_qualified),
+        }
 
     def market_state(date):
         """返回当日估值价、可交易状态，并更新最后有效估值价。"""
@@ -201,12 +282,17 @@ def run_backtest(
         )
         return cash + stock_value
 
-    def rebalance(target_stocks, open_row, tradable):
+    def rebalance(target_stocks, open_row, tradable, target_slots=None):
         """卖出优先、再按可用现金比例买入；返回实际成交和账户状态。"""
         nonlocal cash
         target_stocks = list(dict.fromkeys(target_stocks))
         nav_before = account_value()
-        target_value = nav_before / len(target_stocks) if target_stocks else 0.0
+        # 策略即使只有少数股票通过 LR 收益门槛，也仍按 TOPK 个资金槽位分配：
+        # 每只目标股票最多获得 1/TOPK，未使用槽位保留现金。如果改成除以实际
+        # 入选数量，就会把被过滤股票的资金免费集中到剩余股票，违背“可以不交易”。
+        # 基准 topk=None 时不需要留槽，仍对当日全部成分股正常等权。
+        slot_count = target_slots if target_slots is not None else len(target_stocks)
+        target_value = nav_before / slot_count if slot_count else 0.0
         target_set = set(target_stocks)
         gross_sell = 0.0
         gross_buy = 0.0
@@ -300,9 +386,19 @@ def run_backtest(
         }
 
     first_entry = min(execution_schedule)
-    # 最后一次目标在 entry 开盘调仓，再持有到下一个开盘结算。
+    # 最后一次目标至少要在 entry 的下一个开盘结算。如果显式传入统一结算日，
+    # 即使测试末段因因子缺失而没有新信号，也继续逐日记录原持仓/现金，确保
+    # EW、LR 和基准覆盖完全相同的日期区间；不能让某个策略静默提前结束。
     last_entry_pos = date_pos[max(execution_schedule)]
-    final_settlement = trading_dates[last_entry_pos + 1]
+    minimum_settlement = trading_dates[last_entry_pos + 1]
+    if simulation_end is None:
+        final_settlement = minimum_settlement
+    else:
+        final_settlement = pd.Timestamp(simulation_end)
+        if final_settlement not in date_pos:
+            raise ValueError(f"simulation_end={final_settlement.date()} 不在交易日历中")
+        if final_settlement < minimum_settlement:
+            raise ValueError("simulation_end 不能早于最后一次信号所需的 T+2 结算日")
     simulation_dates = trading_dates[
         (trading_dates >= first_entry) & (trading_dates <= final_settlement)
     ]
@@ -327,8 +423,15 @@ def run_backtest(
             records.append(record)
 
         if date in execution_schedule:
-            signal_date, target_stocks = execution_schedule[date]
-            trade_stats = rebalance(target_stocks, open_row, tradable)
+            signal_date, scores = execution_schedule[date]
+            target_stocks, selection_stats = select_target_stocks(scores)
+            trade_stats = rebalance(
+                target_stocks,
+                open_row,
+                tradable,
+                target_slots=topk,
+            )
+            trade_stats.update(selection_stats)
             active_interval = {
                 "signal_date": signal_date,
                 "entry_date": date,
@@ -365,6 +468,11 @@ def run_backtest(
                     "frozen_weight": frozen_value / nav if nav > 0 else np.nan,
                     "unfilled_buy_count": 0,
                     "unfilled_sell_count": 0,
+                    "score_count": np.nan,
+                    "buy_qualified_count": np.nan,
+                    "selected_count": len(actual_holdings),
+                    "retained_count": len(actual_holdings),
+                    "threshold_rejected_count": np.nan,
                 },
                 "gross_buy": 0.0,
                 "gross_sell": 0.0,
@@ -701,6 +809,20 @@ if __name__ == "__main__":
 
     test_score_lr = score_lr(test_df, valid_factors, lr)
     print(f"\n  LR 合成得分 shape (test): {test_score_lr.shape}")
+    lr_quantiles = test_score_lr.quantile([0.50, 0.90, 0.95, 0.99, 1.00])
+    print("  LR 测试期预测收益分布（仅用于诊断，不参与确定门槛）:")
+    for quantile, value in lr_quantiles.items():
+        print(f"    P{quantile * 100:>3.0f}: {value:.3%}")
+    print(f"  新买门槛: {LR_MIN_BUY_PREDICTION:.3%}"
+          f"（往返成本 {2 * TRANSACTION_COST:.3%} + 安全余量 {LR_COST_SAFETY_MARGIN:.3%}）")
+    lr_qualified_by_day = test_score_lr.groupby(level="datetime").apply(
+        lambda scores: int((scores >= LR_MIN_BUY_PREDICTION).sum())
+    )
+    print(f"  达到门槛的股票: 平均 {lr_qualified_by_day.mean():.2f} 只/日，"
+          f"有至少 1 只合格股票的日期占比 {(lr_qualified_by_day > 0).mean():.1%}")
+    if lr_qualified_by_day.mean() < 1:
+        print("  [重要提示] 该门槛会使 LR 接近空仓；接近 0 的回撤主要来自持有现金，"
+              "不能解释成模型选股能力变强。若要调整门槛，只能在 valid 期决定。")
 
     print("\n── 在 valid 集上对比两种合成方式的 IC ──")
     for method_name, get_score in [
@@ -738,9 +860,42 @@ if __name__ == "__main__":
     print(f"\n开盘价宽表  shape = {test_open_wide.shape}  ({test_open_wide.shape[0]} 交易日 × {test_open_wide.shape[1]} 股票)")
     print("回测逻辑：T 日收盘生成信号 → T+1 开盘按可成交性买入 → "
           "T+2 开盘卖出/调仓 → 只对实际成交额扣手续费")
+    expected_signal_dates = test_open_wide.index[
+        test_open_wide.index <= pd.Timestamp(TEST_END)
+    ]
+    actual_signal_dates = pd.DatetimeIndex(
+        test_score_ew.index.get_level_values("datetime").unique()
+    )
+    missing_signal_dates = expected_signal_dates.difference(actual_signal_dates)
+    zero_open_dates = expected_signal_dates[
+        test_open_wide.loc[expected_signal_dates].notna().sum(axis=1).eq(0)
+    ]
+    if len(zero_open_dates) > 0:
+        zero_open_text = ", ".join(date.strftime("%Y-%m-%d") for date in zero_open_dates)
+        print(f"  [原始行情警告] 以下交易日所有股票的开盘价均缺失: {zero_open_text}")
+        print("  回测只能沿用最后有效价估值；滚动因子也会在随后一段时间缺失，"
+              "本区间结果不应当作严格实盘结论。")
+    if len(missing_signal_dates) > 0:
+        print(f"  [数据覆盖提示] {len(missing_signal_dates)} 个测试交易日没有完整因子，"
+              f"范围 {missing_signal_dates.min().date()} ~ {missing_signal_dates.max().date()}。")
+        print("  这些日期不生成新目标，账户继续持有上一日实际仓位；"
+              "三组回测仍统一记录到结算日，不能静默缩短策略区间。")
 
     ret_results = {}
-    for method_name, test_score in [("等权EW", test_score_ew), ("LR", test_score_lr)]:
+    strategy_configs = [
+        # EW 是无量纲截面分数，只能用排名缓冲抑制临界换仓，不能与成本比较。
+        ("等权EW", test_score_ew, {
+            "rank_buffer": TOPK_RANK_BUFFER,
+        }),
+        # LR 直接预测 LABEL 收益率：新买需覆盖往返成本和安全余量；老持仓
+        # 预测仍为正且排名没有明显恶化时可以继续持有，避免新增一次卖买成本。
+        ("LR", test_score_lr, {
+            "rank_buffer": TOPK_RANK_BUFFER,
+            "min_buy_score": LR_MIN_BUY_PREDICTION,
+            "min_hold_score": LR_MIN_HOLD_PREDICTION,
+        }),
+    ]
+    for method_name, test_score, strategy_kwargs in strategy_configs:
         section(f"Step 6+7  组合构建 + 回测（{method_name}）")
         ret_df = run_backtest(
             test_score,
@@ -748,12 +903,22 @@ if __name__ == "__main__":
             test_volume_wide,
             topk=TOPK,
             membership_by_date=membership_by_date,
+            simulation_end=settlement_end,
+            **strategy_kwargs,
         )
         ret_results[method_name] = ret_df
 
         avg_turnover = ret_df["turnover"].mean()
+        gross_cum_ret = (1 + ret_df["gross_ret"]).prod() - 1
+        net_cum_ret = (1 + ret_df["net_ret"]).prod() - 1
+        zero_trade_ratio = (ret_df["turnover"] <= 1e-12).mean()
         print(f"  策略日收益序列  shape={ret_df.shape}")
         print(f"  平均实际换手率: {avg_turnover:.1%}（只统计真正成交的金额）")
+        print(f"  毛累计收益: {gross_cum_ret:.2%}  |  净累计收益: {net_cum_ret:.2%}  |  "
+              f"累计成本率近似值: {ret_df['transaction_cost'].sum():.2%}")
+        print(f"  平均入选: {ret_df['selected_count'].mean():.1f}/{TOPK}  |  "
+              f"平均现金权重: {ret_df['cash_weight'].mean():.1%}  |  "
+              f"零成交日占比: {zero_trade_ratio:.1%}")
         print(f"  未成交买入: {ret_df['unfilled_buy_count'].sum()} 只次  |  "
               f"未成交卖出: {ret_df['unfilled_sell_count'].sum()} 只次")
         last_record = ret_df.iloc[-1]
@@ -783,6 +948,7 @@ if __name__ == "__main__":
         test_volume_wide,
         topk=None,
         membership_by_date=membership_by_date,
+        simulation_end=settlement_end,
     )
     ret_results["基准"] = benchmark_df
     print(f"  基准日收益序列  shape={benchmark_df.shape}")
