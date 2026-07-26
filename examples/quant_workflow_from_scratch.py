@@ -76,6 +76,22 @@ def segment(df, start, end):
     return df[(d >= start) & (d <= end)]
 
 
+def build_membership_by_date(membership_dict, dates):
+    """将 Qlib 的 {stock: [(start, end), ...]} 转为 {date: set(stocks)}。
+
+    因子预处理需要按信号日过滤成分股，而交易模拟还需要在
+    T+1 开盘真正下单时再校验一次当日成分资格。
+    """
+    dates = pd.DatetimeIndex(dates).sort_values().unique()
+    result = {date: set() for date in dates}
+    for stock, spans in membership_dict.items():
+        for start, end in spans:
+            active_dates = dates[(dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))]
+            for date in active_dates:
+                result[date].add(stock)
+    return result
+
+
 def score_equal_weight(df, factors, directions):
     """按训练期 IC 方向统一因子含义后等权合成；+1 保持原值，-1 反向。"""
     aligned_directions = pd.Series(
@@ -106,13 +122,21 @@ def calc_performance(series):
     }
 
 
-def run_backtest(test_score, test_open_wide, test_volume_wide):
+def run_backtest(
+    test_score,
+    test_open_wide,
+    test_volume_wide,
+    topk=TOPK,
+    membership_by_date=None,
+):
     """
     Step 6+7 合并：按开盘价逐日维护实际持仓、现金和冻结持仓。
 
     test_score    : 测试期合成得分 Series，索引 = (datetime, instrument)
     test_open_wide: 测试期开盘价宽表，shape = (交易日, 股票数)
     test_volume_wide: 测试期成交量宽表，用于识别零成交量的不可交易日
+    topk         : 选取得分最高的股票数；None 表示选取当日全部候选股
+    membership_by_date: {date: set(stocks)}，在实际成交日再校验成分资格
     返回          : DataFrame，每行是一个开盘到次日开盘的账户收益区间
 
     简化成交规则：
@@ -121,26 +145,34 @@ def run_backtest(test_score, test_open_wide, test_volume_wide):
     - 买入失败时资金留在现金；卖出失败时仓位继续持有并冻结。
     - 手续费只对实际成交金额收取。
     """
-    # Step 6：每个信号日取合成得分最高的 TOPK 只股票。
-    # test_score 在上游已经按 membership_dict 过滤，因此成分股资格只决定
-    # “想买什么”，不被误用为“当天能否成交”的判断。
-    targets_by_signal = {}
-    for date, grp in test_score.groupby(level="datetime"):
-        top_stocks = grp.xs(date, level="datetime").nlargest(TOPK).index.tolist()
-        targets_by_signal[pd.Timestamp(date)] = top_stocks
-
-    # Step 7：将 T 日信号安排到 T+1 开盘执行。
+    # Step 6+7：将 T 日信号安排到 T+1 开盘执行。
     # T 日完整行情收盘后才能生成信号，因此最早在 T+1 开盘成交；普通 A 股当天
     # 买入后不能当天卖出，所以在 T+2 开盘退出或调仓。收益区间必须与 LABEL 一致：
     # open[T+2] / open[T+1] - 1。
     trading_dates = pd.DatetimeIndex(test_open_wide.index).sort_values()
     date_pos = {date: pos for pos, date in enumerate(trading_dates)}
     execution_schedule = {}
-    for signal_date, target_stocks in sorted(targets_by_signal.items()):
+    for date, grp in test_score.groupby(level="datetime"):
+        signal_date = pd.Timestamp(date)
         pos = date_pos.get(signal_date)
         if pos is None or pos + 2 >= len(trading_dates):
             continue
-        execution_schedule[trading_dates[pos + 1]] = (signal_date, target_stocks)
+        entry_date = trading_dates[pos + 1]
+        scores = grp.xs(date, level="datetime")
+
+        # 策略得分在信号日 T 已按当日成分股过滤；这里在 T+1
+        # 真正成交前再校验一次，避免成分调整生效日买入已退出股票。
+        # 成分资格只决定“允许买什么”，当日能否成交仍由价格
+        # 和成交量判断。
+        if membership_by_date is not None:
+            current_members = membership_by_date.get(entry_date, set())
+            scores = scores[scores.index.isin(current_members)]
+
+        if topk is None:
+            target_stocks = scores.index.tolist()
+        else:
+            target_stocks = scores.nlargest(topk).index.tolist()
+        execution_schedule[entry_date] = (signal_date, target_stocks)
 
     if not execution_schedule:
         return pd.DataFrame()
@@ -402,7 +434,9 @@ if __name__ == "__main__":
     membership_dict = D.list_instruments(  # 记录了每只股票曾经入选 CSI 300 的时间段
         D.instruments(UNIVERSE),  # 构造"CSI 300 股票池"的描述对象，此时还没有真正查数据
         start_time=DATA_START,
-        end_time=TEST_END,
+        # 最后一个信号要到 TEST_END 之后的 T+1 才成交，所以成分
+        # 资格也必须加载到结算日，不能在 TEST_END 提前截断。
+        end_time=settlement_end,
         freq="day",
         as_list=False,          # 保留 {stock: [(start, end), ...]}，后续 universe 过滤用
     )
@@ -693,10 +727,14 @@ if __name__ == "__main__":
     # ─────────────────────────────────────────────────────
     # Step 6+7  组合构建 + 回测（EW 和 LR 各走一遍）
     # ─────────────────────────────────────────────────────
-    # 信号仍由 test_df 严格限制在 TEST_END 以内；这里只额外保留两个交易日的
-    # 开盘价，用来结算最后两个信号对应的 T+1 入场和 T+2 退出。
+    # 信号仍由 test_df 严格限制在 TEST_END 以内；这里额外保留两个交易日的
+    # 行情，用来提供最后一个信号的 T+1 入场和 T+2 退出。
     test_open_wide = open_.loc[TEST_START:settlement_end]
     test_volume_wide = volume.loc[TEST_START:settlement_end]
+    membership_by_date = build_membership_by_date(
+        membership_dict,
+        test_open_wide.index,
+    )
     print(f"\n开盘价宽表  shape = {test_open_wide.shape}  ({test_open_wide.shape[0]} 交易日 × {test_open_wide.shape[1]} 股票)")
     print("回测逻辑：T 日收盘生成信号 → T+1 开盘按可成交性买入 → "
           "T+2 开盘卖出/调仓 → 只对实际成交额扣手续费")
@@ -704,7 +742,13 @@ if __name__ == "__main__":
     ret_results = {}
     for method_name, test_score in [("等权EW", test_score_ew), ("LR", test_score_lr)]:
         section(f"Step 6+7  组合构建 + 回测（{method_name}）")
-        ret_df = run_backtest(test_score, test_open_wide, test_volume_wide)
+        ret_df = run_backtest(
+            test_score,
+            test_open_wide,
+            test_volume_wide,
+            topk=TOPK,
+            membership_by_date=membership_by_date,
+        )
         ret_results[method_name] = ret_df
 
         avg_turnover = ret_df["turnover"].mean()
@@ -718,21 +762,46 @@ if __name__ == "__main__":
               f"  剩余冻结持仓={int(last_record['frozen_count'])} 只")
         print(ret_df.head(5).round(5))
 
+    # 构造“当日 CSI300 成分股等权”基准。这组全 0 得分只是为了
+    # 复用同一个回测函数；run_backtest 会在每个 T+1 实际成交日
+    # 按 membership_by_date 保留当日成分股。topk=None 表示全部等权
+    # 持有，而不是像 EW/LR 策略那样只取 Top30。
+    benchmark_signal_dates = test_open_wide.index[
+        (test_open_wide.index >= pd.Timestamp(TEST_START))
+        & (test_open_wide.index <= pd.Timestamp(TEST_END))
+    ]
+    benchmark_index = pd.MultiIndex.from_product(
+        [benchmark_signal_dates, test_open_wide.columns],
+        names=["datetime", "instrument"],
+    )
+    benchmark_score = pd.Series(0.0, index=benchmark_index)
+
+    section("Step 6+7  组合构建 + 回测（当日 CSI300 成分股等权基准）")
+    benchmark_df = run_backtest(
+        benchmark_score,
+        test_open_wide,
+        test_volume_wide,
+        topk=None,
+        membership_by_date=membership_by_date,
+    )
+    ret_results["基准"] = benchmark_df
+    print(f"  基准日收益序列  shape={benchmark_df.shape}")
+    print(f"  平均实际换手率: {benchmark_df['turnover'].mean():.1%}")
+    print(f"  未成交买入: {benchmark_df['unfilled_buy_count'].sum()} 只次  |  "
+          f"未成交卖出: {benchmark_df['unfilled_sell_count'].sum()} 只次")
+    benchmark_last = benchmark_df.iloc[-1]
+    print(f"  期末清仓: {benchmark_df.index[-1].date()}  "
+          f"清仓后现金权重={benchmark_last['cash_weight']:.1%}  "
+          f"剩余冻结持仓={int(benchmark_last['frozen_count'])} 只")
+
     # ─────────────────────────────────────────────────────
     # 绩效汇总对比
     # ─────────────────────────────────────────────────────
     section("绩效汇总对比")
 
-    # 基准必须与策略使用完全相同的 T+1 开盘到 T+2 开盘收益区间。
-    # 这里仍沿用原脚本的“股票合集等权”简化基准；严格的当日 CSI300 基准属于后续问题。
-    benchmark_ret = pd.Series({
-        exit_date: (
-            test_open_wide.loc[exit_date]
-            / test_open_wide.loc[row["entry_date"]]
-            - 1
-        ).mean()
-        for exit_date, row in ret_results["等权EW"].iterrows()
-    })
+    # 基准与两种策略共用同一个状态化回测账户，因此这里直接
+    # 使用其已扣除实际买卖成本的净收益，不再对历史成分股合集求均值。
+    benchmark_ret = benchmark_df["net_ret"]
 
     perf = {
         "等权EW": calc_performance(ret_results["等权EW"]["net_ret"]),
