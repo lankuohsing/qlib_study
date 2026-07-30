@@ -564,6 +564,30 @@ if __name__ == "__main__":
     # 排序保证后续 xs()、loc[] 等标签操作的正确性（不只是性能）
     raw_df = raw_df.swaplevel().sort_index()
 
+    data_range_tag = f"{TRAIN_START.replace('-', '')}_{TEST_END.replace('-', '')}"
+    export_prefix = f"raw_ohlcv_{UNIVERSE}_{data_range_tag}"
+    raw_df_path = os.path.join("outputs", f"{export_prefix}.csv")
+    membership_path = os.path.join("outputs", f"{export_prefix}_membership.csv")
+    raw_export_df = raw_df.reset_index()[
+        ["datetime", "instrument", "open", "high", "low", "close", "volume"]
+    ]
+    membership_df = pd.DataFrame(
+        [
+            {
+                "instrument": stock,
+                "start_time": start,
+                "end_time": end,
+            }
+            for stock, spans in membership_dict.items()
+            for start, end in spans
+        ],
+        columns=["instrument", "start_time", "end_time"],
+    ).sort_values(["instrument", "start_time"])
+    raw_export_df.to_csv(raw_df_path, index=False, date_format="%Y-%m-%d")
+    membership_df.to_csv(membership_path, index=False, date_format="%Y-%m-%d")
+    print(f"原始行情已保存 → {raw_df_path}")
+    print(f"成分股区间已保存 → {membership_path}")
+
     n_days   = raw_df.index.get_level_values("datetime").nunique()
     n_stocks = raw_df.index.get_level_values("instrument").nunique()
 
