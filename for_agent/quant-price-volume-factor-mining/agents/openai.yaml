@@ -1,0 +1,4 @@
+interface:
+  display_name: "Price-Volume Factor Mining"
+  short_description: "Compute leakage-safe OHLCV factors and open-to-open labels"
+  default_prompt: "Use $quant-price-volume-factor-mining to compute factor and label files from an OHLCV CSV."

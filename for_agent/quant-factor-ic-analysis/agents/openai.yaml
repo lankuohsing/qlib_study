@@ -1,0 +1,4 @@
+interface:
+  display_name: "Training-Period Factor IC Analysis"
+  short_description: "Measure factor IC, stability, direction, and candidate quality"
+  default_prompt: "Use $quant-factor-ic-analysis to evaluate training-period factor IC and select candidates."

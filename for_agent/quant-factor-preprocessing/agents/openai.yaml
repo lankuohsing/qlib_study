@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cross-Sectional Factor Preprocessing"
+  short_description: "Prepare dynamic-universe scoring and labeled factor samples"
+  default_prompt: "Use $quant-factor-preprocessing to prepare scoring, labeled, train, valid, and test factor samples."

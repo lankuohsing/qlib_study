@@ -1,0 +1,4 @@
+interface:
+  display_name: "Factor Score Combination"
+  short_description: "Build leakage-safe directional EW and linear regression scores"
+  default_prompt: "Use $quant-factor-combination to generate leakage-safe EW and LR scores for each data split."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Stateful Quant Portfolio Backtest"
+  short_description: "Backtest scores with cash, fills, membership, and frozen holdings"
+  default_prompt: "Use $quant-portfolio-backtest to run stateful Top-K backtests from one or more score files."
