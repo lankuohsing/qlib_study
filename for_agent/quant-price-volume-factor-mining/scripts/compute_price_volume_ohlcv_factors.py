@@ -71,8 +71,21 @@ def load_raw_ohlcv(raw_csv: str | Path) -> pd.DataFrame:
             f"输入 CSV 至少需要包含：{INDEX_COLUMNS + REQUIRED_COLUMNS}"
         )
 
+    # 将 CSV 中的 datetime 字符串统一解析为 pandas 日期时间类型；errors="raise"
+    # 表示遇到无法识别的日期时立即报错，避免错误日期悄悄变成缺失值并进入因子计算。
     raw_df["datetime"] = pd.to_datetime(raw_df["datetime"], errors="raise")
+
+    # 将 open/high/low/close/volume 五个行情字段统一转换为 float32：确保后续运算使用
+    # 数值类型，同时相比默认 float64 减少约一半内存占用；非法数值会在此处直接报错。
     raw_df[REQUIRED_COLUMNS] = raw_df[REQUIRED_COLUMNS].astype("float32")
+
+    # 把 datetime、instrument 两列设为按“日期 → 股票”排列的 MultiIndex，并按索引排序，
+    # 方便后续按日期/股票切片，以及通过 unstack("instrument") 转成日期×股票宽表。
+    # 【风险点/以后可改】数据契约要求 (datetime, instrument) 唯一，但当前没有在这里
+    # 主动检查重复主键；若存在重复记录，后面的 unstack() 才会报错，提示不够直观。
+    # 可在 set_index 前用 raw_df.duplicated(INDEX_COLUMNS) 检查并展示重复样本。
+    # 还可增加 OHLCV 合法性检查，例如价格必须为正、成交量不能为负、high >= low，
+    # 且正常情况下 open/close 应位于 [low, high] 内；异常记录宜报警或置为 NaN。
     raw_df = raw_df.set_index(INDEX_COLUMNS).sort_index()
     return raw_df[REQUIRED_COLUMNS]
 
@@ -102,34 +115,54 @@ def compute_price_volume_factors(raw_df: pd.DataFrame) -> tuple[pd.DataFrame, di
 
     # 显式复现 pandas pct_change 的旧默认行为：先前向填充宽表缺口，再计算日收益。
     # 这样可以贴近原脚本中的 close.pct_change()。
+    # 【风险点/以后可改】ffill 会把停牌或缺价期间视为价格不变、日收益为 0，且可能让
+    # VOL_20D 在当日 close 本身缺失时仍有数值；这与没有填充的 MOM/MA_DEV 口径不同。
+    # 教学上可选择更严格的 close.pct_change(fill_method=None)，完整保留缺失传播；
+    # 若保留停牌按 0 收益的估值口径，建议至少在最终 VOL_20D 上用 .where(close.notna())，
+    # 避免给当日没有有效收盘价的股票输出看似可用的波动率因子。
     daily_return = close.ffill().pct_change(fill_method=None)
 
     factors_wide = {
-        "MOM_5D": close / close.shift(5) - 1,
-        "MOM_20D": close / close.shift(20) - 1,
-        "VOL_20D": daily_return.rolling(20).std(),
-        "TURN_5D": volume / volume.rolling(5).mean(),
-        "MA_DEV": close / close.rolling(20).mean() - 1,
-        "DAY_RANGE": (high - low) / close.shift(1),
-        "PRICE_POS": (close - low) / (high - low + 1e-9),
+        "MOM_5D": close / close.shift(5) - 1,# 今日收盘价 ÷ 5个交易日前收盘价 - 1
+        "MOM_20D": close / close.shift(20) - 1,# 20日收益动量
+        "VOL_20D": daily_return.rolling(20).std(),# 20日收益波动率
+        # 【命名提示/以后可改】该公式是“成交量比”而非真正换手率；真正换手率还需要
+        # 流通股本。当前5日均量包含今日成交量；若要衡量今日相对“此前5日”的放量，
+        # 可改为 volume / volume.shift(1).rolling(5).mean()，并考虑重命名 VOLUME_RATIO_5D。
+        "TURN_5D": volume / volume.rolling(5).mean(),# 今日成交量 ÷ 最近5个交易日平均成交量；5日成交量比
+        "MA_DEV": close / close.rolling(20).mean() - 1,# 相对20日均线的偏离程度
+        "DAY_RANGE": (high - low) / close.shift(1),# 当日振幅
+        # 【重要风险点/以后优先改】+1e-9 虽可避免除零，但当 high == low 或 OHLC 数据
+        # 不一致时，会把极小误差放大成巨大有限值；NaN 诊断也发现不了这种异常。
+        # 更严谨的做法是仅在 high > low 且 low <= close <= high 时计算，其余置为 NaN：
+        # price_range = high - low
+        # valid = price_range.gt(0) & close.ge(low) & close.le(high)
+        # PRICE_POS = ((close - low) / price_range).where(valid)
+        "PRICE_POS": (close - low) / (high - low + 1e-9),# 收盘价在当日区间中的位置
         # T 日收盘后生成信号，T+1 开盘成交，T+2 开盘调仓/退出。
         # 标签和回测持有区间必须完全一致，不能用 T 日收盘价成交。
+        # 【边界说明/以后可增强】这里只按开盘价构造理论收益标签，没有检查 T+1/T+2
+        # 是否可交易（例如零成交量、停牌、涨跌停）；教学流程可在后续训练样本或回测
+        # 阶段结合成交量和交易规则处理，不能把“有 LABEL”直接等同于“一定能成交”。
         "LABEL": open_.shift(-2) / open_.shift(-1) - 1,
     }
 
     factor_df = pd.concat(
         {name: stack_wide_frame(frame) for name, frame in factors_wide.items()},
         axis=1,
-    )
+    )# 主键是datetime和instrument，列是因子名称；长表格式
     factor_df.index.names = ["datetime", "instrument"]
 
-    wide_diagnostics = {
+    # 【风险点/以后可改】当前诊断主要统计 NaN，无法识别“不是 NaN 但数值明显异常”的
+    # 情况，例如 inf、PRICE_POS 超出 [0, 1] 或由极小分母产生的超大值。可为每个因子
+    # 增加有限值 min/max、inf_count 和业务范围越界数量，并记录公式及信息可用时点。
+    wide_diagnostics = {# 为 factors_wide 中的每个因子生成一份数据质量诊断信息
         name: {
             "shape": list(frame.shape),
             "nan_pct": float(frame.isna().mean().mean() * 100),
         }
         for name, frame in factors_wide.items()
-    }
+    }# 因子宽表的形状；缺失值占全部单元格的百分比。
     warnings = []
     if diagnostics_nan_pct := float(factor_df.isna().any(axis=1).mean() * 100):
         if diagnostics_nan_pct > 50:
@@ -253,7 +286,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="从固定原始行情 CSV 计算量价/行情类基础因子。",
     )
-    parser.add_argument("--raw-csv", required=True, help="原始行情 CSV 路径，必须包含 datetime、instrument、open、high、low、close、volume。")
+    parser.add_argument("--raw-csv", default=r"D:\projects\github\qlib_study\datasets\exported\raw_ohlcv_csi300_20100101_20190601.csv", help="原始行情 CSV 路径，必须包含 datetime、instrument、open、high、low、close、volume。")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="输出目录。")
     parser.add_argument("--output-prefix", default=None, help="输出文件名前缀；不传则根据 --raw-csv 文件名自动生成。")
     parser.add_argument("--preview-rows", type=int, default=20, help="预览 CSV 保存的行数。")

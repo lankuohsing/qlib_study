@@ -15,8 +15,9 @@ Step 6+7 对等权（EW）和线性回归（LR）两种合成方式分别执行�
 每个步骤均打印数据 shape，方便形象理解数据流动。
 """
 
-import os
+import json
 import warnings
+from pathlib import Path
 
 warnings.filterwarnings("ignore")
 
@@ -57,13 +58,21 @@ TOPK_RANK_BUFFER = 5
 # 的单边成本对应 0.2% 的往返成本；这里再留 0.1% 安全余量，要求预测收益
 # 至少达到 0.3% 才允许新买。安全余量是事先固定的配置，不根据 test 表现调参。
 LR_COST_SAFETY_MARGIN = 0.001
+# LR 新开仓门槛：预测收益率至少要覆盖一次买入成本、未来一次卖出成本，
+# 再加安全余量；以当前参数计算为 2 × 0.1% + 0.1% = 0.3%。低于该值不新买。
 LR_MIN_BUY_PREDICTION = 2 * TRANSACTION_COST + LR_COST_SAFETY_MARGIN
 
 # 已持有股票若预测收益仍为正，可以在排名缓冲范围内继续持有，因为“不卖也不买”
 # 不会在本次调仓新增交易成本。若预测收益转负，则不再仅靠缓冲强行保留。
+# LR 老仓持有门槛：0.0 表示预测收益率必须大于等于 0 才可借助排名缓冲继续持有；
+# 它不要求再次覆盖往返成本，因为继续持有本身不会在本次调仓产生新的买卖费用。
 LR_MIN_HOLD_PREDICTION = 0.0
 
 FACTOR_COLS = ["MOM_5D", "MOM_20D", "VOL_20D", "TURN_5D", "MA_DEV", "DAY_RANGE", "PRICE_POS"]
+
+# 所有阶段产物固定保存在本脚本旁边的 outputs 目录。使用绝对路径可以避免
+# 因启动脚本时的当前工作目录不同，而把结果误写到仓库根目录或其他位置。
+OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 
 # ─────────────────────────────────────────────────────────
 # 辅助函数（模块顶层，子进程重新导入时也能访问）
@@ -512,7 +521,12 @@ def run_backtest(
 # ─────────────────────────────────────────────────────────
 if __name__ == "__main__":
 
-    os.makedirs("outputs", exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    saved_outputs = {}
+
+    def remember_output(name, path):
+        """记录阶段产物，脚本结束时统一生成便于交接和核对的清单。"""
+        saved_outputs[name] = str(Path(path).resolve())
 
     # ─────────────────────────────────────────────────────
     # Step 1  数据加载
@@ -566,8 +580,8 @@ if __name__ == "__main__":
 
     data_range_tag = f"{TRAIN_START.replace('-', '')}_{TEST_END.replace('-', '')}"
     export_prefix = f"raw_ohlcv_{UNIVERSE}_{data_range_tag}"
-    raw_df_path = os.path.join("outputs", f"{export_prefix}.csv")
-    membership_path = os.path.join("outputs", f"{export_prefix}_membership.csv")
+    raw_df_path = OUTPUT_DIR / f"{export_prefix}.csv"
+    membership_path = OUTPUT_DIR / f"{export_prefix}_membership.csv"
     raw_export_df = raw_df.reset_index()[
         ["datetime", "instrument", "open", "high", "low", "close", "volume"]
     ]
@@ -585,6 +599,8 @@ if __name__ == "__main__":
     ).sort_values(["instrument", "start_time"])
     raw_export_df.to_csv(raw_df_path, index=False, date_format="%Y-%m-%d")
     membership_df.to_csv(membership_path, index=False, date_format="%Y-%m-%d")
+    remember_output("step1_raw_ohlcv", raw_df_path)
+    remember_output("step1_membership", membership_path)
     print(f"原始行情已保存 → {raw_df_path}")
     print(f"成分股区间已保存 → {membership_path}")
 
@@ -614,7 +630,9 @@ if __name__ == "__main__":
     print(f"宽表 close  shape = {close.shape}  ({close.shape[0]} 交易日 × {close.shape[1]} 股票)")
     print("（每个字段都是同样形状的宽表，以下因子计算均在宽表上进行）\n")
 
-    daily_return = close.pct_change()  # 每只股票每天相对前一天收盘价的涨跌幅
+    # 显式采用与 quant-price-volume-factor-mining skill 相同的缺失值口径：先用最近
+    # 有效收盘价前向填充，再计算涨跌幅；fill_method=None 禁止 pct_change 二次填充。
+    daily_return = close.ffill().pct_change(fill_method=None)
 
     # 因子名        计算公式                            经济含义
     # MOM_5D        close[t] / close[t-5]  - 1          5 日动量（短期趋势）
@@ -659,6 +677,50 @@ if __name__ == "__main__":
     print(f"  每行含义：一只股票在某个交易日的 7 个因子值 + 1 个 label")
     print(f"  总行数 ≈ {close.shape[0]} 交易日 × {close.shape[1]} 股票 = {close.shape[0] * close.shape[1]}"
           f"（含 NaN 未删除）")
+
+    # 保存 Step 2 原始因子长表。字段契约与量价因子 skill 一致：
+    # datetime,instrument,<7 个因子>,LABEL，且保留所有 NaN 供后续阶段按用途处理。
+    step2_factor_path = OUTPUT_DIR / f"step2_price_volume_ohlcv_factors_{export_prefix}.csv.gz"
+    factor_df.to_csv(step2_factor_path, compression="gzip", date_format="%Y-%m-%d")
+    factor_wide_frames = {
+        "MOM_5D": MOM_5D,
+        "MOM_20D": MOM_20D,
+        "VOL_20D": VOL_20D,
+        "TURN_5D": TURN_5D,
+        "MA_DEV": MA_DEV,
+        "DAY_RANGE": DAY_RANGE,
+        "PRICE_POS": PRICE_POS,
+        "LABEL": LABEL,
+    }
+    step2_diagnostics = {
+        "说明": "Step 2 原始量价因子；LABEL 为 T+1 开盘至 T+2 开盘收益，NaN 未删除。",
+        "raw_shape": list(raw_df.shape),
+        "date_min": str(raw_df.index.get_level_values("datetime").min().date()),
+        "date_max": str(raw_df.index.get_level_values("datetime").max().date()),
+        "n_days": int(n_days),
+        "n_instruments": int(n_stocks),
+        "wide_shape": list(close.shape),
+        "factor_shape": list(factor_df.shape),
+        "factor_columns": FACTOR_COLS,
+        "label_column": "LABEL",
+        "label_interval": "open[T+2] / open[T+1] - 1",
+        "wide_factor_diagnostics": {
+            name: {
+                "shape": list(frame.shape),
+                "nan_pct": float(frame.isna().mean().mean() * 100),
+            }
+            for name, frame in factor_wide_frames.items()
+        },
+        "long_table_nan_rows": int(factor_df.isna().any(axis=1).sum()),
+        "long_table_nan_row_pct": float(factor_df.isna().any(axis=1).mean() * 100),
+    }
+    step2_diagnostics_path = OUTPUT_DIR / f"step2_price_volume_ohlcv_factors_{export_prefix}_diagnostics.json"
+    step2_diagnostics_path.write_text(
+        json.dumps(step2_diagnostics, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    remember_output("step2_factors", step2_factor_path)
+    remember_output("step2_diagnostics", step2_diagnostics_path)
+    print(f"Step 2 原始因子已保存 → {step2_factor_path}")
 
     # ─────────────────────────────────────────────────────
     # Step 3  因子预处理（截面标准化）
@@ -726,6 +788,42 @@ if __name__ == "__main__":
         print(f"  {name} ({s} ~ {e})  shape={df.shape}"
               f"  → {n_d} 交易日 × ~{n_s} 股票/日")
 
+    # 保存与 quant-factor-preprocessing skill 对应的 Step 3 数据集。
+    step3_datasets = {
+        "scoring": scoring_df,
+        "labeled": labeled_df,
+        "train": train_df,
+        "valid": valid_df,
+        "test": test_df,
+    }
+    for split_name, split_df in step3_datasets.items():
+        split_path = OUTPUT_DIR / f"step3_preprocessed_{export_prefix}_{split_name}.csv.gz"
+        split_df.to_csv(split_path, compression="gzip", date_format="%Y-%m-%d")
+        remember_output(f"step3_{split_name}", split_path)
+
+    step3_diagnostics = {
+        "说明": "先按当日 CSI300 成员过滤并截面预处理；scoring 不查看 LABEL，labeled 再要求 LABEL 非空。",
+        "input_shape": list(factor_df.shape),
+        "universe_filtered_shape": list(processed.shape),
+        "scoring_shape": list(scoring_df.shape),
+        "labeled_shape": list(labeled_df.shape),
+        "scoring_rows_with_missing_label": int(scoring_df["LABEL"].isna().sum()),
+        "splits": {
+            name: {
+                "shape": list(df.shape),
+                "date_min": str(df.index.get_level_values("datetime").min().date()),
+                "date_max": str(df.index.get_level_values("datetime").max().date()),
+            }
+            for name, df in {"train": train_df, "valid": valid_df, "test": test_df}.items()
+        },
+    }
+    step3_diagnostics_path = OUTPUT_DIR / f"step3_preprocessed_{export_prefix}_diagnostics.json"
+    step3_diagnostics_path.write_text(
+        json.dumps(step3_diagnostics, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    remember_output("step3_diagnostics", step3_diagnostics_path)
+    print(f"Step 3 预处理数据已保存 → {OUTPUT_DIR}")
+
     # ─────────────────────────────────────────────────────
     # Step 4  因子有效性分析（IC / ICIR）
     # ─────────────────────────────────────────────────────
@@ -737,9 +835,10 @@ if __name__ == "__main__":
 
     n_train_days = train_df.index.get_level_values("datetime").nunique()
     ic_records   = {}
+    daily_ic_records = {}
 
     for factor in FACTOR_COLS:
-        ic_list = []
+        ic_by_date = {}
         for date, grp in train_df.groupby(level="datetime"):
             grp_flat = grp.xs(date, level="datetime")
             valid = grp_flat[[factor, "LABEL"]].dropna()
@@ -748,8 +847,9 @@ if __name__ == "__main__":
             ic_val, _ = stats.spearmanr(valid[factor], valid["LABEL"])
             if pd.isna(ic_val):
                 continue
-            ic_list.append(ic_val)
-        s = pd.Series(ic_list)
+            ic_by_date[date] = float(ic_val)
+        s = pd.Series(ic_by_date, name=factor, dtype=float).sort_index()
+        daily_ic_records[factor] = s
         ic_records[factor] = {
             "IC均值":   round(s.mean(), 4),
             "IC标准差": round(s.std(),  4),
@@ -759,6 +859,8 @@ if __name__ == "__main__":
         }
 
     ic_table = pd.DataFrame(ic_records).T
+    daily_ic_df = pd.DataFrame(daily_ic_records).sort_index()
+    daily_ic_df.index.name = "datetime"
     print(f"IC 分析结果（基于 train 段 {n_train_days} 个交易日）:")
     print(ic_table.to_string())
 
@@ -768,6 +870,39 @@ if __name__ == "__main__":
     else:
         print("\n未筛选到显著有效因子（阈值 0.02），改为使用全部因子")
         valid_factors = FACTOR_COLS
+
+    factor_corr = train_df[FACTOR_COLS].corr(method="spearman")
+    step4_ic_path = OUTPUT_DIR / f"step4_factor_ic_{export_prefix}_ic_analysis.csv"
+    step4_daily_ic_path = OUTPUT_DIR / f"step4_factor_ic_{export_prefix}_daily_ic.csv.gz"
+    step4_corr_path = OUTPUT_DIR / f"step4_factor_ic_{export_prefix}_factor_corr.csv"
+    step4_selected_path = OUTPUT_DIR / f"step4_factor_ic_{export_prefix}_selected_factors.json"
+    ic_table.to_csv(step4_ic_path, encoding="utf-8-sig")
+    daily_ic_df.to_csv(step4_daily_ic_path, compression="gzip", date_format="%Y-%m-%d")
+    factor_corr.to_csv(step4_corr_path, encoding="utf-8-sig")
+    step4_selected_path.write_text(
+        json.dumps(
+            {
+                "selected_factors": valid_factors,
+                "factor_directions": {
+                    factor: float(1.0 if ic_table.loc[factor, "IC均值"] >= 0 else -1.0)
+                    for factor in valid_factors
+                },
+                "train_ic_mean": {
+                    factor: float(ic_table.loc[factor, "IC均值"])
+                    for factor in valid_factors
+                },
+                "ic_mean_threshold": 0.02,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    remember_output("step4_ic_analysis", step4_ic_path)
+    remember_output("step4_daily_ic", step4_daily_ic_path)
+    remember_output("step4_factor_corr", step4_corr_path)
+    remember_output("step4_selected_factors", step4_selected_path)
+    print(f"Step 4 IC 分析结果已保存 → {OUTPUT_DIR}")
 
     # ─────────────────────────────────────────────────────
     # Step 5  因子合成
@@ -823,7 +958,8 @@ if __name__ == "__main__":
 
     lr = LinearRegression().fit(X_tr, y_tr)
 
-    coef_df = pd.Series(dict(zip(valid_factors, lr.coef_))).round(6)
+    # 保留模型原始精度用于落盘对比；终端展示时再格式化为 6 位小数。
+    coef_df = pd.Series(dict(zip(valid_factors, lr.coef_)), name="coefficient")
     print(f"  学到的因子权重（回归系数）:")
     for fname, coef in coef_df.items():
         print(f"    {fname:<12} : {coef:+.6f}")
@@ -831,8 +967,64 @@ if __name__ == "__main__":
     print(f"  训练集 R²={lr.score(X_tr, y_tr):.5f}")
     print("  （量化信号 R² 通常 < 0.01，说明股票涨跌难以预测，属正常现象）")
 
+    train_score_lr = score_lr(train_df, valid_factors, lr)
+    valid_score_lr = score_lr(valid_df, valid_factors, lr)
     test_score_lr = score_lr(test_df, valid_factors, lr)
     print(f"\n  LR 合成得分 shape (test): {test_score_lr.shape}")
+
+    # 保存与 quant-factor-combination skill 对应的两种方法、三个时间段得分。
+    step5_scores = {
+        "equal_weight": {
+            "train": train_score_ew,
+            "valid": valid_score_ew,
+            "test": test_score_ew,
+        },
+        "linear_regression": {
+            "train": train_score_lr,
+            "valid": valid_score_lr,
+            "test": test_score_lr,
+        },
+    }
+    score_column_names = {
+        "equal_weight": "equal_weight_score",
+        "linear_regression": "linear_regression_score",
+    }
+    for method, split_scores in step5_scores.items():
+        for split_name, score in split_scores.items():
+            score_path = OUTPUT_DIR / f"step5_factor_combination_{method}_{split_name}_score.csv.gz"
+            score.rename(score_column_names[method]).to_frame().to_csv(
+                score_path, compression="gzip", date_format="%Y-%m-%d"
+            )
+            remember_output(f"step5_{method}_{split_name}_score", score_path)
+
+    step5_coefficients_path = OUTPUT_DIR / "step5_factor_combination_linear_regression_coefficients.csv"
+    coef_df.rename_axis("factor").to_frame().to_csv(step5_coefficients_path, encoding="utf-8-sig")
+    step5_diagnostics_path = OUTPUT_DIR / "step5_factor_combination_diagnostics.json"
+    step5_diagnostics_path.write_text(
+        json.dumps(
+            {
+                "selected_factors": valid_factors,
+                "factor_directions": {
+                    factor: float(factor_directions[factor]) for factor in valid_factors
+                },
+                "linear_regression_coefficients": {
+                    factor: float(coef_df[factor]) for factor in valid_factors
+                },
+                "linear_regression_intercept": float(lr.intercept_),
+                "linear_regression_train_r2": float(lr.score(X_tr, y_tr)),
+                "score_shapes": {
+                    method: {split: [int(len(score))] for split, score in split_scores.items()}
+                    for method, split_scores in step5_scores.items()
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    remember_output("step5_lr_coefficients", step5_coefficients_path)
+    remember_output("step5_diagnostics", step5_diagnostics_path)
+    print(f"Step 5 合成得分已保存 → {OUTPUT_DIR}")
     lr_quantiles = test_score_lr.quantile([0.50, 0.90, 0.95, 0.99, 1.00])
     print("  LR 测试期预测收益分布（仅用于诊断，不参与确定门槛）:")
     for quantile, value in lr_quantiles.items():
@@ -851,7 +1043,7 @@ if __name__ == "__main__":
     print("\n── 在 valid 集上对比两种合成方式的 IC ──")
     for method_name, get_score in [
         ("等权EW", lambda: valid_score_ew),
-        ("LR",     lambda: score_lr(valid_df, valid_factors, lr)),
+        ("LR",     lambda: valid_score_lr),
     ]:
         s = get_score()
         ic_vals = []
@@ -931,6 +1123,10 @@ if __name__ == "__main__":
             **strategy_kwargs,
         )
         ret_results[method_name] = ret_df
+        method_slug = {"等权EW": "equal_weight", "LR": "linear_regression"}[method_name]
+        daily_returns_path = OUTPUT_DIR / f"step6_7_portfolio_backtest_{method_slug}_daily_returns.csv"
+        ret_df.to_csv(daily_returns_path, encoding="utf-8-sig", date_format="%Y-%m-%d")
+        remember_output(f"step6_7_{method_slug}_daily_returns", daily_returns_path)
 
         avg_turnover = ret_df["turnover"].mean()
         gross_cum_ret = (1 + ret_df["gross_ret"]).prod() - 1
@@ -975,6 +1171,9 @@ if __name__ == "__main__":
         simulation_end=settlement_end,
     )
     ret_results["基准"] = benchmark_df
+    benchmark_returns_path = OUTPUT_DIR / "step6_7_portfolio_backtest_benchmark_daily_returns.csv"
+    benchmark_df.to_csv(benchmark_returns_path, encoding="utf-8-sig", date_format="%Y-%m-%d")
+    remember_output("step6_7_benchmark_daily_returns", benchmark_returns_path)
     print(f"  基准日收益序列  shape={benchmark_df.shape}")
     print(f"  平均实际换手率: {benchmark_df['turnover'].mean():.1%}")
     print(f"  未成交买入: {benchmark_df['unfilled_buy_count'].sum()} 只次  |  "
@@ -1019,8 +1218,36 @@ if __name__ == "__main__":
         "lr_excess":     cum_lr   / cum_bench,
     })
     nav_df.index = nav_df.index.strftime("%Y-%m-%d")
-    nav_df.to_csv("outputs/nav_curve.csv")
-    print(f"\n净值曲线已保存 → outputs/nav_curve.csv  shape={nav_df.shape}")
+    nav_path = OUTPUT_DIR / "step6_7_portfolio_backtest_nav_curve.csv"
+    metrics_path = OUTPUT_DIR / "step6_7_portfolio_backtest_metrics.csv"
+    metrics_json_path = OUTPUT_DIR / "step6_7_portfolio_backtest_metrics.json"
+    nav_df.to_csv(nav_path, encoding="utf-8-sig")
+    pd.DataFrame(perf).T.to_csv(metrics_path, encoding="utf-8-sig")
+    metrics_json_path.write_text(
+        json.dumps(perf, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    remember_output("step6_7_nav_curve", nav_path)
+    remember_output("step6_7_metrics_csv", metrics_path)
+    remember_output("step6_7_metrics_json", metrics_json_path)
+    print(f"\n净值曲线已保存 → {nav_path}  shape={nav_df.shape}")
 
-    ic_table.to_csv("outputs/ic_analysis.csv")
-    print(f"IC 分析已保存 → outputs/ic_analysis.csv")
+    # 最后写出完整产物清单，便于把 examples 的每一步与独立 skill 输出逐一对应。
+    manifest_path = OUTPUT_DIR / "step_outputs_manifest.json"
+    manifest = {
+        "说明": "quant_workflow_from_scratch.py 各阶段落盘结果清单。",
+        "config": {
+            "universe": UNIVERSE,
+            "data_start": DATA_START,
+            "train": [TRAIN_START, TRAIN_END],
+            "valid": [VALID_START, VALID_END],
+            "test": [TEST_START, TEST_END],
+            "settlement_end": str(settlement_end.date()),
+            "topk": TOPK,
+            "transaction_cost": TRANSACTION_COST,
+        },
+        "outputs": saved_outputs,
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(f"全部阶段产物清单已保存 → {manifest_path}")
