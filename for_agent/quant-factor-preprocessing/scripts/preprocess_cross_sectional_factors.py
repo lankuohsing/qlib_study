@@ -46,10 +46,10 @@ MEMBERSHIP_COLUMNS = ["instrument", "start_time", "end_time"]
 DEFAULT_OUTPUT_DIR = "for_agent/results/factor_preprocessing"
 DEFAULT_FACTOR_CSV = (
     "for_agent/results/price_volume_ohlcv_factors/"
-    "price_volume_ohlcv_factors_raw_ohlcv_csi300_20140601_20200801.csv.gz"
+    "price_volume_ohlcv_factors_raw_ohlcv_csi300_20100101_20190601.csv.gz"
 )
 DEFAULT_MEMBERSHIP_CSV = (
-    "datasets/exported/raw_ohlcv_csi300_20140601_20200801_membership.csv"
+    "datasets/exported/raw_ohlcv_csi300_20100101_20190601_membership.csv"
 )
 DEFAULT_TRAIN_START = "2010-01-01"
 DEFAULT_TRAIN_END = "2014-12-31"
@@ -150,9 +150,9 @@ def load_membership_table(membership_csv: str | Path) -> pd.DataFrame:
 
 
 def winsorize_cs(s: pd.Series, n_sigma: float = 3.0) -> pd.Series:
-    """MAD 法截面去极值。"""
-    median = s.median()
-    mad = (s - median).abs().median()
+    """MAD 法截面去极值。对“当日股票池内的因子值”执行每日截面去极值处理"""
+    median = s.median()# 同一天，同一个因子的股票截面的中位数
+    mad = (s - median).abs().median()# 同一天，每个股票的因子值与中位数的绝对差值的中位数
     lo = median - n_sigma * 1.4826 * mad
     hi = median + n_sigma * 1.4826 * mad
     return s.clip(lo, hi)
@@ -232,12 +232,12 @@ def validate_split_ranges(
 
 def filter_by_membership(clean_df: pd.DataFrame, membership_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     """只保留当天处于成员资格区间内的股票样本。"""
-    dt = clean_df.index.get_level_values("datetime")
-    ins = clean_df.index.get_level_values("instrument")
-    in_universe = pd.Series(False, index=clean_df.index)
+    dt = clean_df.index.get_level_values("datetime")#取每行日期
+    ins = clean_df.index.get_level_values("instrument")#取每行股票
+    in_universe = pd.Series(False, index=clean_df.index)#全False
 
-    for stock, spans in membership_df.groupby("instrument", sort=False):
-        for row in spans.itertuples(index=False):
+    for stock, spans in membership_df.groupby("instrument", sort=False):#股票，成员资格区间
+        for row in spans.itertuples(index=False):#逐个区间
             in_universe |= (
                 (ins == stock)
                 & (dt >= row.start_time)
@@ -245,7 +245,7 @@ def filter_by_membership(clean_df: pd.DataFrame, membership_df: pd.DataFrame) ->
             )
 
     before = len(clean_df)
-    filtered = clean_df[in_universe]
+    filtered = clean_df[in_universe]#只包含“该股票在该日期属于目标股票池”的记录。
     return filtered, before - len(filtered)
 
 
@@ -274,9 +274,9 @@ def preprocess_factors(
         raise ValueError("成员资格过滤后没有剩余样本，请检查 instrument 命名和成员资格日期区间。")
 
     processed = universe_df.copy()
-    processed[factor_columns] = (
+    processed[factor_columns] = (# 截面处理：比较同一天不同股票，而不是比较一只股票不同日期。
         processed.groupby(level="datetime")[factor_columns].transform(
-            lambda s: winsorize_cs(s, n_sigma=winsor_n_sigma)
+            lambda s: winsorize_cs(s, n_sigma=winsor_n_sigma)# 对每天的每个因子分别调用 winsorize_cs()。
         )
     )
     processed[factor_columns] = (
