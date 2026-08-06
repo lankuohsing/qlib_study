@@ -14,7 +14,7 @@ D:\ProgramData\miniforge3\envs\py312\python.exe for_agent/quant-price-volume-fac
   --raw-csv datasets/exported/raw_ohlcv_csi300_20140601_20200801.csv
 ```
 
-按需传入 `--output-dir`、`--output-prefix` 和 `--preview-rows`。读取 [数据契约](references/data-contract.md) 后再接入其他数据或编写新脚本；A股日频标签与后续调仓之间的时间关系见 [A股日频标签、交易时点与滚动调仓](references/label-and-rebalance-timeline.md)。
+按需传入 `--output-dir`、`--output-prefix` 和 `--preview-rows`。读取 [数据契约](references/data-contract.md) 后再接入其他数据或编写新脚本；A股日频标签与后续调仓之间的时间关系见 [A股日频策略的信号—标签—成交对齐与滚动再平衡](references/label-and-rebalance-timeline.md)。
 
 ## 约束
 
