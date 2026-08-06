@@ -132,12 +132,18 @@ def compute_price_volume_factors(raw_df: pd.DataFrame) -> tuple[pd.DataFrame, di
         "TURN_5D": volume / volume.rolling(5).mean(),# 今日成交量 ÷ 最近5个交易日平均成交量；5日成交量比
         "MA_DEV": close / close.rolling(20).mean() - 1,# 相对20日均线的偏离程度
         "DAY_RANGE": (high - low) / close.shift(1),# 当日振幅
-        # 【重要风险点/以后优先改】+1e-9 虽可避免除零，但当 high == low 或 OHLC 数据
-        # 不一致时，会把极小误差放大成巨大有限值；NaN 诊断也发现不了这种异常。
-        # 更严谨的做法是仅在 high > low 且 low <= close <= high 时计算，其余置为 NaN：
+        # 【重要风险点/以后优先改】high == low 不一定是坏数据：正常上市股票也可能因
+        # 一字涨停/跌停、低流动性或仅在单一价格成交而全天没有价格区间。但对
+        # PRICE_POS=(close-low)/(high-low) 而言，此时“收盘在日内区间的位置”在数学上
+        # 仍然没有定义。+1e-9 虽可避免除零，却会把某些微小误差放大成巨大有限值；
+        # 即使 close == high == low 时得到 0，也会被误解为“收盘位于最低端”。后续 MAD
+        # 可以截断巨大值，但不能修复这种经济含义错误。更严谨的做法是仅在 high > low
+        # 且 low <= close <= high 时计算，其余置为 NaN：
         # price_range = high - low
         # valid = price_range.gt(0) & close.ge(low) & close.le(high)
         # PRICE_POS = ((close - low) / price_range).where(valid)
+        # 如需保留一字板/单一价格交易日的信息，可另建 ONE_PRICE_DAY=(high==low) 指标，
+        # 不要通过给 PRICE_POS 强行赋 0、0.5 或 1 来混合两种不同的经济含义。
         "PRICE_POS": (close - low) / (high - low + 1e-9),# 收盘价在当日区间中的位置
         # T 日收盘后生成信号，T+1 开盘成交，T+2 开盘调仓/退出。
         # 标签和回测持有区间必须完全一致，不能用 T 日收盘价成交。

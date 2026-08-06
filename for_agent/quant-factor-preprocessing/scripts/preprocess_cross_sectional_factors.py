@@ -276,20 +276,36 @@ def preprocess_factors(
     processed = universe_df.copy()
     processed[factor_columns] = (# 截面处理：比较同一天不同股票，而不是比较一只股票不同日期。
         processed.groupby(level="datetime")[factor_columns].transform(
-            lambda s: winsorize_cs(s, n_sigma=winsor_n_sigma)# 对每天的每个因子分别调用 winsorize_cs()。
+            lambda s: winsorize_cs(s, n_sigma=winsor_n_sigma)# 对每天的每个因子分别去极值。
         )
     )
-    processed[factor_columns] = (
+    processed[factor_columns] = (#z-score标准化
         processed.groupby(level="datetime")[factor_columns].transform(zscore_cs)
     )
 
-    nan_rows_before = int(factor_df.isna().any(axis=1).sum())
+    nan_rows_before = int(factor_df.isna().any(axis=1).sum())#有多少行至少包含一个nan因子值
     # 生成信号时未来 LABEL 尚不可知，绝不能用 LABEL 是否缺失筛选候选股票。
-    scoring_df = processed.dropna(subset=factor_columns)
+    # 【当前教学口径】只要任意一个因子为 NaN，就不让该行参与打分。这种完整样本法
+    # 简单、保守且容易解释，但会更容易排除新上市、停牌或行情不连续的股票；同时，
+    # 一个因子缺失也会让其余已经可用的因子无法发挥作用。
+    #
+    # 【以后可研究的缺失值方案；实施时必须只使用信号时点已经可知的信息】
+    # 1. 每日截面中位数填充：在当日真实股票池内，使用同一天该因子的中位数填补
+    #    NaN；不能使用未来日期统计量，也应先保存原始缺失位置再进行填充。
+    # 2. 增加“因子是否缺失”指示变量：例如 MOM_20D_IS_MISSING=1/0，让模型区分
+    #    “真实值接近中位数”和“原始值缺失后被填充”，保留缺失本身可能携带的信息。
+    # 3. 使用原生支持缺失值的模型：让模型直接处理 NaN，但仍需确认具体模型的缺失
+    #    分支含义、训练与预测口径一致，并防止缺失模式成为意外的样本选择偏差。
+    # 4. 单因子 IC 分析采用成对删除：分析某个因子时，只删除“该因子或 LABEL”缺失
+    #    的行，不应因其他无关因子缺失而损失当前因子的有效样本。
+    # 5. 只要求一定数量的因子可用：例如 7 个因子中至少 5 个非空即可打分；此时合成
+    #    得分必须按实际可用因子重新归一化，并检查不同股票得分的可比性。
+    # 无论选择哪种方案，scoring 的筛选和填补都不能查看未来 LABEL 是否缺失或其数值。
+    scoring_df = processed.dropna(subset=factor_columns)#去掉包含nan因子值的行
     if scoring_df.empty:
         raise ValueError("因子列去除缺失值后没有可打分样本，请检查因子计算和数据覆盖。")
     # 训练与 IC 才需要正确答案；它是 scoring_df 的严格子集。
-    labeled_df = scoring_df.dropna(subset=[LABEL_COLUMN])
+    labeled_df = scoring_df.dropna(subset=[LABEL_COLUMN])# 删除标签缺失记录，得到可训练数据。
     if labeled_df.empty:
         raise ValueError("没有同时具备因子和 LABEL 的训练/评估样本。")
 
